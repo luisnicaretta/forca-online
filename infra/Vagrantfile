@@ -1,0 +1,70 @@
+Vagrant.configure("2") do |config|
+  config.vm.box = "ubuntu/jammy64"
+  config.vm.synced_folder ".", "/vagrant", disabled: true
+  config.vm.synced_folder "..", "/project", type: "virtualbox"
+
+  machines = [
+    { name: "primary", ip: "192.168.56.11", state: "MASTER", priority: 150,
+      server_args: "--role=primary --port=5050 --peer=192.168.56.12:5051" },
+    { name: "backup", ip: "192.168.56.12", state: "BACKUP", priority: 100,
+      server_args: "--role=backup --port=5050 --replication-port=5051" }
+  ]
+
+  machines.each do |m|
+    config.vm.define m[:name] do |node|
+      node.vm.hostname = "forca-#{m[:name]}"
+      node.vm.network "private_network", ip: m[:ip]
+      node.vm.provider "virtualbox" do |vb|
+        vb.name = "forca-#{m[:name]}"
+        vb.memory = 768
+        vb.cpus = 1
+      end
+
+      node.vm.provision "shell", inline: <<-SHELL
+        set -e
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -qq
+        apt-get install -y -qq openjdk-17-jre-headless keepalived
+
+        cat > /etc/keepalived/keepalived.conf <<'EOF'
+vrrp_instance FORCA_VI {
+    state #{m[:state]}
+    interface eth1
+    virtual_router_id 51
+    priority #{m[:priority]}
+    advert_int 1
+    authentication {
+        auth_type PASS
+        auth_pass forca26
+    }
+    virtual_ipaddress {
+        192.168.56.100/24
+    }
+}
+EOF
+
+        cat > /etc/systemd/system/forca.service <<'EOF'
+[Unit]
+Description=Servidor do Jogo da Forca
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/project
+ExecStart=/usr/bin/java /project/server/Server.java #{m[:server_args]} --words=server/words.txt
+Restart=always
+RestartSec=2
+User=vagrant
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+        systemctl daemon-reload
+        systemctl enable --now keepalived
+        systemctl enable --now forca
+      SHELL
+    end
+  end
+end
