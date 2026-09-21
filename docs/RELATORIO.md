@@ -103,3 +103,17 @@ Esta solução recupera o estado da aplicação; ela não tenta migrar a conexã
 - uma versão de produção deveria utilizar banco replicado ou log durável, TLS e monitoramento.
 
 Essas limitações não impedem a demonstração dos requisitos, mas devem ser apresentadas com transparência.
+
+
+## Abandono de jogadores e correções de concorrência
+
+**W.O.** — um `ScheduledExecutorService` (watchdog) verifica as partidas a cada segundo. Um jogador desconectado por mais de `--grace` segundos, ou que não joga na sua vez por mais de `--turn-timeout` segundos, perde por W.O.; a saída voluntária (`QUIT`) dá W.O. imediato. O reserva só ativa o watchdog ao receber o primeiro cliente (failover).
+
+**Condições de corrida corrigidas**
+- `broadcast`/`stateMessage` liam o conjunto de letras sem lock (risco de `ConcurrentModificationException`) e podiam entregar estados fora de ordem; agora são montados e enviados sob `stateLock`.
+- O pareamento segurava o 1º jogador bloqueado esperando o 2º sem verificar se ele continuava conectado; agora é revalidado a cada 500 ms. A entrada na fila é atômica (sem duplicatas).
+- A replicação usava uma thread por snapshot (entrega fora de ordem); agora há um único replicador que envia só o snapshot mais recente de cada partida, e snapshots atrasados de partidas antigas são ignorados.
+- Jogadores/partidas abandonados são removidos (antes vazavam memória).
+- Ordem de aquisição de locks padronizada: semáforo da partida → `stateLock`.
+
+**Limitação conhecida:** a réplica continua assíncrona; uma jogada em andamento no instante da queda do principal pode ser perdida.

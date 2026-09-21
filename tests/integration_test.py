@@ -47,6 +47,11 @@ class TestClient:
 
     def close(self):
         try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            self.reader.close()
             self.sock.close()
         except OSError:
             pass

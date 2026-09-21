@@ -46,6 +46,8 @@ public class Server {
         int replicationPort = 5051;
         String secret = "forca-replica-2026";
         String wordsFile = "words.txt";
+        int graceSeconds = 30;
+        int turnTimeoutSeconds = 120;
 
         static Config parse(String[] args) {
             Config c = new Config();
@@ -55,13 +57,16 @@ public class Server {
                 else if (arg.startsWith("--replication-port=")) c.replicationPort = Integer.parseInt(arg.substring(19));
                 else if (arg.startsWith("--secret=")) c.secret = arg.substring(9);
                 else if (arg.startsWith("--words=")) c.wordsFile = arg.substring(8);
+                else if (arg.startsWith("--grace=")) c.graceSeconds = Integer.parseInt(arg.substring(8));
+                else if (arg.startsWith("--turn-timeout=")) c.turnTimeoutSeconds = Integer.parseInt(arg.substring(15));
                 else if (arg.startsWith("--peer=")) {
                     String[] address = arg.substring(7).split(":", 2);
                     c.peerHost = address[0];
                     if (address.length == 2) c.peerPort = Integer.parseInt(address[1]);
                 } else if (arg.equals("--help")) {
                     System.out.println("Opcoes: --port=N --role=primary|backup --peer=HOST:PORT " +
-                            "--replication-port=N --secret=CHAVE --words=ARQUIVO");
+                            "--replication-port=N --secret=CHAVE --words=ARQUIVO " +
+                            "--grace=SEG (espera por reconexao, padrao 30) --turn-timeout=SEG (0 desativa, padrao 120)");
                     System.exit(0);
                 }
             }
@@ -81,6 +86,14 @@ public class Server {
         final AtomicLong matchSequence = new AtomicLong(System.currentTimeMillis());
         final WordBank wordBank;
         final Replicator replicator;
+        final Object lobbyLock = new Object();
+        final ScheduledExecutorService watchdog = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "watchdog-wo");
+            t.setDaemon(true);
+            return t;
+        });
+        /** O reserva so passa a cobrar W.O. depois que assume (primeiro cliente conectado). */
+        volatile boolean active;
         volatile boolean running = true;
         ServerSocket gameSocket;
         ReplicationReceiver receiver;
@@ -89,6 +102,7 @@ public class Server {
             this.config = config;
             this.wordBank = new WordBank(config.wordsFile);
             this.replicator = new Replicator(config);
+            this.active = config.role.equals("primary");
         }
 
         void start() throws IOException {
@@ -97,6 +111,9 @@ public class Server {
                 clients.submit(receiver);
             }
             clients.submit(this::matchPlayers);
+            watchdog.scheduleWithFixedDelay(() -> {
+                try { watchdogTick(); } catch (Exception e) { log("Erro no watchdog: " + e); }
+            }, 1, 1, TimeUnit.SECONDS);
             gameSocket = new ServerSocket();
             gameSocket.setReuseAddress(true);
             gameSocket.bind(new InetSocketAddress(config.port));
@@ -132,8 +149,10 @@ public class Server {
 
                 String name = sanitizeName(dec(fields[1]));
                 String requestedToken = fields[2];
-                if (!requestedToken.equals("-") && playersByToken.containsKey(requestedToken)) {
-                    player = playersByToken.get(requestedToken);
+                activate();
+                Player existing = requestedToken.equals("-") ? null : playersByToken.get(requestedToken);
+                if (existing != null) {
+                    player = existing;
                     if (!player.name.equalsIgnoreCase(name)) {
                         connection.send("ERROR|" + enc("Token pertence a outro jogador"));
                         return;
@@ -142,8 +161,8 @@ public class Server {
                     connection.send("WELCOME|" + player.token + "|RECONNECTED");
                     if (player.game != null) player.game.onReconnect(player);
                     else {
+                        enqueue(player);
                         connection.send("WAITING|" + waitingRoom.size());
-                        if (!waitingRoom.contains(player)) waitingRoom.offer(player);
                     }
                     log(name + " reconectou com token " + shortToken(player.token));
                 } else {
@@ -151,7 +170,7 @@ public class Server {
                     player = new Player(name, token, connection);
                     playersByToken.put(token, player);
                     connection.send("WELCOME|" + token + "|NEW");
-                    waitingRoom.put(player);
+                    enqueue(player);
                     connection.send("WAITING|" + waitingRoom.size());
                     log(name + " entrou na sala de espera");
                 }
@@ -181,7 +200,12 @@ public class Server {
                 return;
             }
             if (fields[0].equals("QUIT")) {
-                if (player.connection != null) player.connection.close();
+                player.left = true;
+                GameSession g = player.game;
+                if (g != null) g.onQuit(player);
+                else forget(player);
+                Connection c = player.connection;
+                if (c != null) c.close();
                 return;
             }
             if (player.game == null) {
@@ -207,11 +231,33 @@ public class Server {
             else player.game.guess(player, guess);
         }
 
-        void matchPlayers() {
+        void enqueue(Player player) {
+            synchronized (lobbyLock) {
+                if (player.game == null && !waitingRoom.contains(player)) waitingRoom.offer(player);
+            }
+        }
+
+        static boolean isMatchable(Player p) {
+            return p != null && p.game == null && p.isConnected();
+        }
+
+       void matchPlayers() {
+            Player first = null;
             while (running) {
                 try {
-                    Player p1 = takeConnectedWaitingPlayer();
-                    Player p2 = takeConnectedWaitingPlayer();
+                    if (first == null) first = takeConnectedWaitingPlayer();
+                    Player second = waitingRoom.poll(500, TimeUnit.MILLISECONDS);
+                    if (!isMatchable(first)) {
+                        first = isMatchable(second) ? second : null;
+                        continue;
+                    }
+                    if (second == null || second == first || !isMatchable(second)) continue;
+
+                    Player p1 = first;
+                    Player p2 = second;
+                    first = null;
+                    p1.errors = 0;
+                    p2.errors = 0;
                     String id = Long.toString(matchSequence.incrementAndGet());
                     WordEntry selected = wordBank.randomWord();
                     GameSession game = new GameSession(this, id, selected.word(), selected.category(), p1, p2);
@@ -231,8 +277,42 @@ public class Server {
         Player takeConnectedWaitingPlayer() throws InterruptedException {
             while (true) {
                 Player player = waitingRoom.take();
-                if (player.game == null && player.isConnected()) return player;
+                if (isMatchable(player)) return player;
             }
+        }
+
+        synchronized void activate() {
+            if (active) return;
+            active = true;
+            long now = System.currentTimeMillis();
+            for (Player p : playersByToken.values()) if (!p.isConnected()) p.disconnectedSince = now;
+            for (GameSession g : games.values()) g.turnStartedAt = now;
+            log("Reserva assumiu o servico; controle de W.O. ativado.");
+        }
+
+        void watchdogTick() {
+            if (!active || !running) return;
+            long now = System.currentTimeMillis();
+            for (GameSession g : new ArrayList<>(games.values())) g.checkTimeouts(now);
+            long graceMs = config.graceSeconds * 1000L;
+            for (Player p : new ArrayList<>(playersByToken.values())) {
+                if (p.isConnected()) continue;
+                boolean expired = p.left || (p.disconnectedSince > 0 && now - p.disconnectedSince > graceMs);
+                if (!expired) continue;
+                GameSession g = p.game;
+                if (g == null || g.isFinished()) forget(p);
+            }
+        }
+
+        void forget(Player p) {
+            synchronized (lobbyLock) { waitingRoom.remove(p); }
+            playersByToken.remove(p.token, p);
+            GameSession g = p.game;
+            if (g != null) {
+                Player o = g.other(p);
+                if (playersByToken.get(o.token) != o) games.remove(g.id, g);
+            }
+            log(p.name + " removido (saiu ou nao reconectou)");
         }
 
         synchronized void applySnapshot(String payload) {
@@ -240,16 +320,20 @@ public class Server {
                 GameSnapshot snapshot = GameSnapshot.parse(payload);
                 GameSession current = games.get(snapshot.id);
                 if (current != null && current.version >= snapshot.version) return;
+                matchSequence.accumulateAndGet(Long.parseLong(snapshot.id), Math::max);
 
                 Player p1 = playersByToken.computeIfAbsent(snapshot.p1Token,
                         token -> new Player(snapshot.p1Name, token, null));
                 Player p2 = playersByToken.computeIfAbsent(snapshot.p2Token,
                         token -> new Player(snapshot.p2Name, token, null));
-                p1.errors = snapshot.p1Errors;
-                p2.errors = snapshot.p2Errors;
+
+                if (isOlder(p1, snapshot.id) || isOlder(p2, snapshot.id)) return;
 
                 GameSession game = current;
                 if (game == null) {
+                    for (Player p : List.of(p1, p2)) {
+                        if (p.game != null) games.remove(p.game.id, p.game);
+                    }
                     game = new GameSession(this, snapshot.id, snapshot.word, snapshot.category, p1, p2);
                     games.put(snapshot.id, game);
                     p1.game = game;
@@ -262,10 +346,17 @@ public class Server {
             }
         }
 
+        static boolean isOlder(Player p, String snapshotId) {
+            GameSession g = p.game;
+            return g != null && Long.parseLong(g.id) > Long.parseLong(snapshotId);
+        }
+
         void close() {
             running = false;
             try { if (gameSocket != null) gameSocket.close(); } catch (IOException ignored) {}
             if (receiver != null) receiver.close();
+            watchdog.shutdownNow();
+            replicator.close();
             clients.shutdownNow();
         }
 
@@ -282,6 +373,8 @@ public class Server {
         volatile Connection connection;
         volatile GameSession game;
         volatile int errors;
+        volatile long disconnectedSince;
+        volatile boolean left;
 
         Player(String name, String token, Connection connection) {
             this.name = name;
@@ -292,11 +385,16 @@ public class Server {
         synchronized void attach(Connection next) {
             Connection old = connection;
             connection = next;
+            disconnectedSince = 0;
+            left = false;
             if (old != null && old != next) old.close();
         }
 
         synchronized void detach(Connection expected) {
-            if (connection == expected) connection = null;
+            if (connection == expected) {
+                connection = null;
+                disconnectedSince = System.currentTimeMillis();
+            }
         }
 
         boolean isConnected() {
@@ -351,6 +449,8 @@ public class Server {
         volatile String status = "PLAYING";
         volatile String winnerToken = "-";
         volatile long version = 1;
+        volatile long turnStartedAt = System.currentTimeMillis();
+        volatile String lastMessage = "";
 
         GameSession(GameServer server, String id, String word, String category, Player p1, Player p2) {
             this.server = server;
@@ -404,6 +504,7 @@ public class Server {
                         message += " " + player.name + " completou a forca.";
                     } else {
                         turnIndex = 1 - turnIndex;
+                        turnStartedAt = System.currentTimeMillis();
                     }
                     version++;
                     broadcast(message);
@@ -453,6 +554,7 @@ public class Server {
                             message += " " + player.name + " completou a forca.";
                         } else {
                             turnIndex = 1 - turnIndex;
+                        turnStartedAt = System.currentTimeMillis();
                         }
                     }
                     version++;
@@ -477,6 +579,11 @@ public class Server {
                 try {
                     if (!status.equals("FINISHED")) {
                         player.send("ERROR|" + enc("A partida ainda nao terminou"));
+                        return;
+                    }
+                    Player opponent = other(player);
+                    if (server.games.get(id) != this || opponent.left || !opponent.isConnected()) {
+                        requeueLocked(player, "O adversario saiu.");
                         return;
                     }
                     if (!replayReady.add(player.token)) return;
@@ -508,27 +615,125 @@ public class Server {
         }
 
         void onReconnect(Player player) {
-            broadcast(player.name + " reconectou à partida.");
+            if (players[turnIndex] == player) turnStartedAt = System.currentTimeMillis();
+            broadcast(status.equals("PLAYING") ? player.name + " reconectou a partida." : lastMessage);
         }
 
         void onDisconnect(Player player) {
-            broadcast(player.name + " perdeu a conexao; aguardando reconexao.");
+            if (player.left || !status.equals("PLAYING")) return;
+            broadcast(player.name + " perdeu a conexao; tem " + server.config.graceSeconds
+                    + "s para voltar antes do W.O.");
+        }
+
+        void onQuit(Player player) {
+            locked(() -> {
+                if (status.equals("PLAYING")) {
+                    forfeitLocked(player, player.name + " saiu da partida. Vitoria por W.O.!");
+                } else {
+                    Player opponent = other(player);
+                    if (replayReady.contains(opponent.token)) requeueLocked(opponent, "O adversario saiu.");
+                }
+            });
+        }
+
+        boolean isFinished() { return status.equals("FINISHED"); }
+
+        boolean unavailable(Player p, long now) {
+            if (p.left) return true;
+            return !p.isConnected() && p.disconnectedSince > 0
+                    && now - p.disconnectedSince > server.config.graceSeconds * 1000L;
+        }
+
+        void checkTimeouts(long now) {
+            locked(() -> {
+                if (status.equals("PLAYING")) {
+                    Player a = players[0], b = players[1];
+                    boolean aGone = unavailable(a, now), bGone = unavailable(b, now);
+                    if (aGone || bGone) {
+                        Player loser = aGone && bGone ? (a.disconnectedSince <= b.disconnectedSince ? a : b)
+                                : (aGone ? a : b);
+                        forfeitLocked(loser, loser.name + " ficou offline por mais de "
+                                + server.config.graceSeconds + "s. Vitoria por W.O.!");
+                        return;
+                    }
+                    int limit = server.config.turnTimeoutSeconds;
+                    if (limit > 0 && now - turnStartedAt > limit * 1000L) {
+                        Player current = players[turnIndex];
+                        forfeitLocked(current, current.name + " nao jogou em " + limit
+                                + "s. Vitoria por W.O.!");
+                    }
+                } else {
+                    for (Player x : players) {
+                        if (replayReady.contains(x.token) && unavailable(other(x), now)) {
+                            requeueLocked(x, "O adversario saiu.");
+                        }
+                    }
+                }
+            });
+        }
+
+        private void forfeitLocked(Player loser, String message) {
+            status = "FINISHED";
+            winnerToken = other(loser).token;
+            version++;
+            broadcast(message);
+            replicate();
+            log("Partida " + id + " encerrada por W.O.: " + loser.name + " perdeu");
+        }
+
+        private void requeueLocked(Player player, String why) {
+            replayReady.clear();
+            server.games.remove(id, this);
+            player.game = null;
+            player.errors = 0;
+            server.enqueue(player);
+            player.send("WAITING|" + server.waitingRoom.size() + "|" + enc(why + " Procurando novo adversario..."));
+            log(player.name + " voltou para a sala de espera (adversario saiu)");
+        }
+
+        private void locked(Runnable action) {
+            boolean acquired = false;
+            try {
+                semaphore.acquire();
+                acquired = true;
+                stateLock.lock();
+                try {
+                    action.run();
+                } finally {
+                    stateLock.unlock();
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } finally {
+                if (acquired) semaphore.release();
+            }
         }
 
         void broadcast(String message) {
-            String state = stateMessage(message);
-            players[0].send(state);
-            players[1].send(state);
+            stateLock.lock();
+            try {
+                lastMessage = message;
+                String state = stateMessage(message);
+                players[0].send(state);
+                players[1].send(state);
+            } finally {
+                stateLock.unlock();
+            }
         }
 
         String stateMessage(String message) {
-            String masked = maskedWord();
-            String letters = guessed.stream().map(String::valueOf).reduce((a, b) -> a + "," + b).orElse("");
-            return String.join("|",
-                    "STATE", id, enc(masked), enc(players[0].name), Integer.toString(players[0].errors),
-                    enc(players[1].name), Integer.toString(players[1].errors), players[turnIndex].token,
-                    enc(letters), status, winnerToken, enc(message), Long.toString(version),
-                    enc(status.equals("FINISHED") ? word : ""), enc(category));
+            stateLock.lock();
+            try {
+                String masked = maskedWord();
+                String letters = guessed.stream().map(String::valueOf).reduce((a, b) -> a + "," + b).orElse("");
+                return String.join("|",
+                        "STATE", id, enc(masked), enc(players[0].name), Integer.toString(players[0].errors),
+                        enc(players[1].name), Integer.toString(players[1].errors), players[turnIndex].token,
+                        enc(letters), status, winnerToken, enc(message), Long.toString(version),
+                        enc(status.equals("FINISHED") ? word : ""), enc(category));
+            } finally {
+                stateLock.unlock();
+            }
         }
 
         String maskedWord() {
@@ -551,10 +756,19 @@ public class Server {
         Player other(Player player) { return players[0] == player ? players[1] : players[0]; }
 
         void replicate() {
-            if (server.config.peerHost != null) server.replicator.send(snapshot().serialize());
+            if (server.config.peerHost != null) server.replicator.send(id, snapshot().serialize());
         }
 
         GameSnapshot snapshot() {
+            stateLock.lock();
+            try {
+                return buildSnapshot();
+            } finally {
+                stateLock.unlock();
+            }
+        }
+
+        private GameSnapshot buildSnapshot() {
             return new GameSnapshot(id, word, players[0].name, players[0].token, players[0].errors,
                     players[1].name, players[1].token, players[1].errors,
                     guessedString(), turnIndex, status, winnerToken, version, category);
@@ -577,6 +791,7 @@ public class Server {
                 status = s.status;
                 winnerToken = s.winnerToken;
                 version = s.version;
+                turnStartedAt = System.currentTimeMillis();
             } finally {
                 stateLock.unlock();
             }
@@ -611,24 +826,59 @@ public class Server {
 
     static final class Replicator {
         final Config config;
+        final ExecutorService worker = Executors.newSingleThreadExecutor(r -> {
+            Thread t = new Thread(r, "replicador");
+            t.setDaemon(true);
+            return t;
+        });
+        final LinkedHashMap<String, String> pending = new LinkedHashMap<>();
+        boolean scheduled;
 
         Replicator(Config config) { this.config = config; }
 
-        void send(String snapshot) {
-            CompletableFuture.runAsync(() -> {
-                try (Socket socket = new Socket()) {
-                    socket.connect(new InetSocketAddress(config.peerHost, config.peerPort), 1200);
-                    PrintWriter out = new PrintWriter(new OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8), true);
-                    BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
-                    out.println("SYNC|" + enc(config.secret) + "|" + snapshot);
-                    socket.setSoTimeout(1200);
-                    String response = in.readLine();
-                    if (!"OK".equals(response)) log("Replica nao confirmou o snapshot");
-                } catch (IOException e) {
-                    log("Aviso: servidor reserva indisponivel: " + e.getMessage());
-                }
-            });
+        void send(String gameId, String snapshot) {
+            synchronized (pending) {
+                pending.remove(gameId);
+                pending.put(gameId, snapshot);
+                if (scheduled) return;
+                scheduled = true;
+            }
+            try {
+                worker.execute(this::drain);
+            } catch (RejectedExecutionException ignored) { }
         }
+
+        private void drain() {
+            while (true) {
+                String snapshot;
+                synchronized (pending) {
+                    Iterator<String> it = pending.values().iterator();
+                    if (!it.hasNext()) {
+                        scheduled = false;
+                        return;
+                    }
+                    snapshot = it.next();
+                    it.remove();
+                }
+                deliver(snapshot);
+            }
+        }
+
+        private void deliver(String snapshot) {
+            try (Socket socket = new Socket()) {
+                socket.connect(new InetSocketAddress(config.peerHost, config.peerPort), 1200);
+                PrintWriter out = new PrintWriter(new OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8), true);
+                BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
+                out.println("SYNC|" + enc(config.secret) + "|" + snapshot);
+                socket.setSoTimeout(1200);
+                String response = in.readLine();
+                if (!"OK".equals(response)) log("Replica nao confirmou o snapshot");
+            } catch (IOException e) {
+                log("Aviso: servidor reserva indisponivel: " + e.getMessage());
+            }
+        }
+
+        void close() { worker.shutdownNow(); }
     }
 
     static final class ReplicationReceiver implements Runnable {

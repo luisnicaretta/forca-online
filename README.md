@@ -174,6 +174,28 @@ Resultado esperado:
 OK: lobby, semaforo, dois bonecos, replicacao e failover validados.
 ```
 
+## Abandono, W.O. e timeouts
+
+O servidor nunca deixa um jogador esperando para sempre:
+
+| Situação | Comportamento |
+|---|---|
+| Jogador fecha o jogo (`QUIT` / `/sair`) | W.O. imediato para o adversário |
+| Conexão cai | o adversário é avisado; o jogador tem `--grace` segundos (padrão 30) para reconectar com o token; depois perde por W.O. |
+| Jogador conectado mas parado na sua vez | perde por W.O. após `--turn-timeout` segundos (padrão 120; `0` desativa). Cobre também quedas "silenciosas" de rede |
+| Os dois somem | perde quem caiu primeiro; a partida e os tokens são removidos |
+| Adversário sai e o outro clica em "Jogar de novo" | volta automaticamente para a sala de espera e é pareado com um novo jogador |
+| Servidor reserva assume após failover | o controle de W.O. só começa quando o reserva recebe o primeiro cliente, para não punir jogadores durante o failover |
+
+Exemplo: `java server/Server.java --grace=20 --turn-timeout=60`
+
+## Testes
+
+```bash
+python3 tests/integration_test.py   # lobby, semáforo, bonecos, replicação, failover
+python3 tests/walkover_test.py      # W.O., timeouts, revanche sem adversário, failover+W.O., carga concorrente
+```
+
 ## Comandos do cliente
 
 - digite uma letra e pressione Enter para jogar;

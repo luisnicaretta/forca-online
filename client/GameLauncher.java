@@ -435,11 +435,21 @@ public class GameLauncher {
                 String[] f = line.split("\\|", -1);
                 switch (f[0]) {
                     case "WELCOME" -> token = f[1];
-                    case "WAITING" -> SwingUtilities.invokeLater(() -> {
-                        message.setText("Você está na sala de espera.");
-                        turn.setText("Aguardando o segundo jogador...");
-                        setGuessControlsEnabled(false);
-                    });
+                    case "WAITING" -> {
+                        gameFinished = false;
+                        replayRequested = false;
+                        myTurn = false;
+                        String waitingInfo = f.length > 2 ? dec(f[2]) : "Você está na sala de espera.";
+                        SwingUtilities.invokeLater(() -> {
+                            currentMatchId = "";
+                            replayButton.setText("JOGAR DE NOVO");
+                            replayButton.setVisible(false);
+                            message.setText(waitingInfo);
+                            message.setForeground(TEXT);
+                            turn.setText("Aguardando o segundo jogador...");
+                            setGuessControlsEnabled(false);
+                        });
+                    }
                     case "ERROR" -> SwingUtilities.invokeLater(() -> {
                         message.setText(dec(f[1]));
                         message.setForeground(RED);
@@ -808,265 +818,23 @@ public class GameLauncher {
 
             int cx = w / 2;
             int top = 68;
-            double availableHeight = Math.max(1, getHeight() - top - 7);
-            double sceneScale = Math.min(1.0, availableHeight / 278.0);
-            Graphics2D scene = (Graphics2D) g.create();
-            scene.translate(cx, top);
-            scene.scale(sceneScale, sceneScale);
-            scene.translate(-cx, -top);
-            paintGallows(scene, cx, top);
-            paintPixelPerson(scene, cx + 65, top);
-            scene.dispose();
+            g.setStroke(new BasicStroke(7, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+            g.setColor(new Color(94, 109, 135));
+            g.drawLine(cx - 145, top + 275, cx + 135, top + 275);
+            g.drawLine(cx - 105, top + 275, cx - 105, top);
+            g.drawLine(cx - 105, top, cx + 65, top);
+            g.drawLine(cx + 65, top, cx + 65, top + 35);
+            g.drawLine(cx - 105, top + 50, cx - 55, top);
+
+            g.setColor(GOLD);
+            g.setStroke(new BasicStroke(7, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+            if (errors >= 1) g.drawOval(cx + 32, top + 35, 66, 66);
+            if (errors >= 2) g.drawLine(cx + 65, top + 101, cx + 65, top + 195);
+            if (errors >= 3) g.drawLine(cx + 65, top + 125, cx + 15, top + 168);
+            if (errors >= 4) g.drawLine(cx + 65, top + 125, cx + 115, top + 168);
+            if (errors >= 5) g.drawLine(cx + 65, top + 195, cx + 20, top + 252);
+            if (errors >= 6) g.drawLine(cx + 65, top + 195, cx + 110, top + 252);
             g.dispose();
-        }
-
-        private void paintGallows(Graphics2D g, int cx, int top) {
-            Graphics2D pixel = (Graphics2D) g.create();
-            pixel.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_OFF);
-            Color darkWood = new Color(76, 49, 36);
-            Color wood = new Color(132, 84, 49);
-            Color lightWood = new Color(180, 122, 67);
-            pixel.setColor(darkWood);
-            pixel.fillRect(cx - 151, top + 266, 292, 12);
-            pixel.fillRect(cx - 112, top - 2, 14, 273);
-            pixel.fillRect(cx - 112, top - 2, 184, 14);
-            pixel.setColor(wood);
-            pixel.fillRect(cx - 147, top + 269, 284, 6);
-            pixel.fillRect(cx - 108, top + 4, 7, 262);
-            pixel.fillRect(cx - 104, top + 2, 170, 7);
-            for (int step = 0; step < 11; step++) {
-                pixel.setColor(step < 3 ? lightWood : wood);
-                pixel.fillRect(cx - 98 + step * 4, top + 46 - step * 4, 8, 8);
-            }
-            pixel.setColor(lightWood);
-            pixel.fillRect(cx - 104, top + 18, 3, 47);
-            pixel.fillRect(cx - 73, top + 3, 46, 3);
-            pixel.setColor(new Color(83, 51, 35));
-            pixel.fillRect(cx - 108, top + 91, 7, 4);
-            pixel.fillRect(cx - 108, top + 196, 7, 5);
-            pixel.fillRect(cx + 2, top + 2, 6, 7);
-            pixel.dispose();
-        }
-
-        private void paintPixelPerson(Graphics2D graphics, int x, int top) {
-            if (errors == 0) return;
-
-            Graphics2D g = (Graphics2D) graphics.create();
-            g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_OFF);
-            int scale = 3;
-            int ox = x - 54;
-            int oy = top + 28;
-
-            Color outline = new Color(25, 25, 34);
-            Color ropeDark = new Color(128, 88, 45);
-            Color rope = new Color(221, 179, 91);
-            Color skinDeep = new Color(109, 58, 48);
-            Color skinDark = new Color(154, 87, 62);
-            Color skin = new Color(210, 137, 91);
-            Color skinLight = new Color(244, 188, 132);
-            Color hairDark = new Color(32, 24, 27);
-            Color hair = new Color(73, 44, 35);
-            Color hairLight = new Color(116, 69, 45);
-            Color eye = new Color(29, 28, 34);
-            Color shirtDeep = me ? new Color(17, 48, 106) : new Color(13, 77, 57);
-            Color shirtDark = me ? new Color(29, 79, 164) : new Color(24, 119, 84);
-            Color shirt = me ? new Color(45, 118, 224) : new Color(43, 175, 122);
-            Color shirtLight = me ? new Color(96, 164, 248) : new Color(96, 218, 163);
-            Color pantsDeep = new Color(29, 35, 57);
-            Color pantsDark = new Color(43, 54, 85);
-            Color pants = new Color(63, 80, 123);
-            Color pantsLight = new Color(94, 115, 162);
-            Color shoeDark = new Color(29, 31, 40);
-            Color shoe = new Color(205, 214, 230);
-            Color shoeLight = new Color(247, 249, 253);
-
-            // Corda atrás do sprite, com dois tons para criar espessura.
-            g.setColor(ropeDark);
-            g.fillRect(x - 3, top + 8, 7, 100);
-            g.setColor(rope);
-            g.fillRect(x - 1, top + 8, 3, 100);
-
-            // Pernas com quadril, joelho, canela, volume do jeans e calçados completos.
-            if (errors >= 5) {
-                pixel(g, outline, ox, oy, 9, 47, 9, 12, scale);
-                pixel(g, outline, ox, oy, 8, 57, 8, 13, scale);
-                pixel(g, pantsDeep, ox, oy, 10, 48, 7, 21, scale);
-                pixel(g, pants, ox, oy, 11, 49, 5, 19, scale);
-                pixel(g, pantsLight, ox, oy, 11, 50, 2, 8, scale);
-                pixel(g, pantsDark, ox, oy, 10, 58, 6, 3, scale);
-                pixel(g, pantsLight, ox, oy, 11, 59, 3, 1, scale);
-                pixel(g, pantsDeep, ox, oy, 9, 66, 7, 4, scale);
-                pixel(g, shoeDark, ox, oy, 3, 68, 13, 5, scale);
-                pixel(g, shoe, ox, oy, 4, 68, 11, 3, scale);
-                pixel(g, shoeLight, ox, oy, 4, 68, 5, 1, scale);
-                pixel(g, shoeDark, ox, oy, 3, 72, 13, 1, scale);
-                pixel(g, pantsLight, ox, oy, 13, 62, 1, 5, scale);
-            }
-            if (errors >= 6) {
-                pixel(g, outline, ox, oy, 18, 47, 9, 12, scale);
-                pixel(g, outline, ox, oy, 20, 57, 8, 13, scale);
-                pixel(g, pantsDeep, ox, oy, 19, 48, 7, 21, scale);
-                pixel(g, pants, ox, oy, 20, 49, 5, 19, scale);
-                pixel(g, pantsLight, ox, oy, 23, 50, 2, 8, scale);
-                pixel(g, pantsDark, ox, oy, 20, 58, 6, 3, scale);
-                pixel(g, pantsLight, ox, oy, 22, 59, 3, 1, scale);
-                pixel(g, pantsDeep, ox, oy, 20, 66, 7, 4, scale);
-                pixel(g, shoeDark, ox, oy, 20, 68, 13, 5, scale);
-                pixel(g, shoe, ox, oy, 21, 68, 11, 3, scale);
-                pixel(g, shoeLight, ox, oy, 27, 68, 5, 1, scale);
-                pixel(g, shoeDark, ox, oy, 20, 72, 13, 1, scale);
-                pixel(g, pantsLight, ox, oy, 22, 62, 1, 5, scale);
-            }
-
-            if (errors >= 3) paintPixelArm(g, ox, oy, scale, false, outline,
-                    shirtDeep, shirtDark, shirt, shirtLight, skinDeep, skinDark, skin, skinLight);
-            if (errors >= 4) paintPixelArm(g, ox, oy, scale, true, outline,
-                    shirtDeep, shirtDark, shirt, shirtLight, skinDeep, skinDark, skin, skinLight);
-
-            if (errors >= 2) {
-                // Pescoço, ombros e moletom com capuz, zíper, bolso e dobras.
-                pixel(g, outline, ox, oy, 14, 20, 8, 7, scale);
-                pixel(g, skinDeep, ox, oy, 15, 20, 6, 6, scale);
-                pixel(g, skin, ox, oy, 16, 20, 5, 5, scale);
-                pixel(g, skinLight, ox, oy, 16, 20, 2, 4, scale);
-
-                pixel(g, outline, ox, oy, 7, 25, 22, 7, scale);
-                pixel(g, outline, ox, oy, 9, 30, 18, 20, scale);
-                pixel(g, shirtDeep, ox, oy, 8, 26, 20, 5, scale);
-                pixel(g, shirtDeep, ox, oy, 10, 30, 16, 19, scale);
-                pixel(g, shirt, ox, oy, 9, 27, 16, 4, scale);
-                pixel(g, shirt, ox, oy, 11, 31, 12, 17, scale);
-                pixel(g, shirtLight, ox, oy, 10, 27, 4, 3, scale);
-                pixel(g, shirtLight, ox, oy, 11, 31, 2, 14, scale);
-                pixel(g, shirtDark, ox, oy, 23, 29, 3, 19, scale);
-                pixel(g, outline, ox, oy, 17, 28, 2, 21, scale);
-                pixel(g, new Color(224, 232, 244), ox, oy, 17, 30, 1, 17, scale);
-                pixel(g, shirtDeep, ox, oy, 12, 40, 5, 2, scale);
-                pixel(g, shirtDeep, ox, oy, 19, 40, 5, 2, scale);
-                pixel(g, shirtDark, ox, oy, 14, 39, 8, 1, scale);
-                pixel(g, outline, ox, oy, 10, 48, 16, 3, scale);
-                pixel(g, shirtDark, ox, oy, 11, 48, 14, 1, scale);
-
-                // Capuz e cordões dão profundidade à parte superior da roupa.
-                pixel(g, outline, ox, oy, 12, 25, 12, 4, scale);
-                pixel(g, shirtDark, ox, oy, 13, 25, 4, 3, scale);
-                pixel(g, shirtDark, ox, oy, 20, 25, 3, 3, scale);
-                pixel(g, shirtLight, ox, oy, 16, 26, 4, 1, scale);
-                pixel(g, shoeLight, ox, oy, 14, 28, 1, 4, scale);
-                pixel(g, shoeLight, ox, oy, 21, 28, 1, 4, scale);
-                pixel(g, GOLD, ox, oy, 14, 32, 2, 1, scale);
-            }
-
-            // Cabeça de maior resolução, com mandíbula, orelhas, cabelo e expressão.
-            pixel(g, outline, ox, oy, 11, 2, 14, 2, scale);
-            pixel(g, outline, ox, oy, 9, 4, 18, 5, scale);
-            pixel(g, outline, ox, oy, 8, 8, 20, 9, scale);
-            pixel(g, outline, ox, oy, 10, 17, 16, 3, scale);
-            pixel(g, outline, ox, oy, 12, 20, 12, 2, scale);
-
-            pixel(g, skinDark, ox, oy, 9, 8, 18, 8, scale);
-            pixel(g, skin, ox, oy, 10, 5, 16, 13, scale);
-            pixel(g, skinLight, ox, oy, 11, 6, 9, 11, scale);
-            pixel(g, skinDark, ox, oy, 8, 10, 3, 5, scale);
-            pixel(g, skin, ox, oy, 7, 11, 3, 4, scale);
-            pixel(g, skinDeep, ox, oy, 8, 12, 1, 2, scale);
-            pixel(g, skinDark, ox, oy, 26, 10, 3, 5, scale);
-            pixel(g, skin, ox, oy, 27, 11, 3, 4, scale);
-            pixel(g, skinDeep, ox, oy, 28, 12, 1, 2, scale);
-            pixel(g, skinDark, ox, oy, 11, 17, 2, 2, scale);
-            pixel(g, skin, ox, oy, 13, 18, 10, 2, scale);
-
-            // Cabelo em camadas, com franja e iluminação lateral.
-            pixel(g, hairDark, ox, oy, 11, 1, 14, 2, scale);
-            pixel(g, hairDark, ox, oy, 9, 3, 18, 5, scale);
-            pixel(g, hair, ox, oy, 11, 3, 13, 3, scale);
-            pixel(g, hairLight, ox, oy, 13, 3, 7, 1, scale);
-            pixel(g, hairDark, ox, oy, 9, 6, 4, 5, scale);
-            pixel(g, hairDark, ox, oy, 23, 6, 4, 4, scale);
-            pixel(g, hair, ox, oy, 13, 6, 4, 2, scale);
-            pixel(g, hairDark, ox, oy, 17, 5, 3, 2, scale);
-            pixel(g, hair, ox, oy, 20, 6, 3, 1, scale);
-
-            // Sobrancelhas, olhos, nariz, boca, queixo e barba sombreada.
-            pixel(g, hairDark, ox, oy, 12, 9, 5, 1, scale);
-            pixel(g, hairDark, ox, oy, 20, 9, 5, 1, scale);
-            if (errors >= 6) {
-                pixel(g, eye, ox, oy, 13, 11, 4, 1, scale);
-                pixel(g, eye, ox, oy, 20, 11, 4, 1, scale);
-            } else {
-                pixel(g, Color.WHITE, ox, oy, 13, 10, 4, 3, scale);
-                pixel(g, Color.WHITE, ox, oy, 20, 10, 4, 3, scale);
-                pixel(g, new Color(68, 101, 111), ox, oy, 15, 11, 2, 2, scale);
-                pixel(g, new Color(68, 101, 111), ox, oy, 20, 11, 2, 2, scale);
-                pixel(g, eye, ox, oy, 16, 11, 1, 2, scale);
-                pixel(g, eye, ox, oy, 20, 11, 1, 2, scale);
-            }
-            pixel(g, skinDark, ox, oy, 18, 11, 2, 4, scale);
-            pixel(g, skinDeep, ox, oy, 17, 15, 4, 1, scale);
-            pixel(g, skinLight, ox, oy, 18, 14, 2, 1, scale);
-            pixel(g, new Color(110, 43, 47), ox, oy, 15, 17, 7, 1, scale);
-            pixel(g, skinDeep, ox, oy, 13, 19, 3, 1, scale);
-            pixel(g, skinDeep, ox, oy, 21, 19, 3, 1, scale);
-            pixel(g, new Color(78, 55, 52), ox, oy, 16, 20, 5, 1, scale);
-
-            if (errors >= 5) {
-                pixel(g, new Color(53, 161, 237), ox, oy, 25, 11, 2, 4, scale);
-                pixel(g, new Color(155, 224, 255), ox, oy, 25, 11, 1, 2, scale);
-            }
-
-            // Laço frontal em duas cores ao redor do pescoço.
-            pixel(g, ropeDark, ox, oy, 12, 21, 12, 1, scale);
-            pixel(g, ropeDark, ox, oy, 11, 22, 2, 3, scale);
-            pixel(g, ropeDark, ox, oy, 24, 22, 2, 3, scale);
-            pixel(g, ropeDark, ox, oy, 13, 24, 11, 1, scale);
-            pixel(g, rope, ox, oy, 13, 21, 10, 1, scale);
-            pixel(g, rope, ox, oy, 12, 22, 1, 2, scale);
-            g.dispose();
-        }
-
-        private void paintPixelArm(Graphics2D g, int ox, int oy, int scale, boolean right,
-                                   Color outline, Color shirtDeep, Color shirtDark,
-                                   Color shirt, Color shirtLight, Color skinDeep,
-                                   Color skinDark, Color skin, Color skinLight) {
-            if (!right) {
-                pixel(g, outline, ox, oy, 4, 27, 6, 13, scale);
-                pixel(g, outline, ox, oy, 2, 38, 6, 12, scale);
-                pixel(g, shirtDeep, ox, oy, 5, 28, 4, 11, scale);
-                pixel(g, shirt, ox, oy, 6, 28, 3, 9, scale);
-                pixel(g, shirtLight, ox, oy, 6, 29, 1, 6, scale);
-                pixel(g, skinDeep, ox, oy, 3, 39, 4, 10, scale);
-                pixel(g, skin, ox, oy, 4, 39, 3, 9, scale);
-                pixel(g, skinLight, ox, oy, 4, 40, 1, 5, scale);
-                pixel(g, outline, ox, oy, 0, 48, 7, 6, scale);
-                pixel(g, skinDark, ox, oy, 1, 48, 5, 5, scale);
-                pixel(g, skin, ox, oy, 2, 48, 4, 3, scale);
-                pixel(g, skinLight, ox, oy, 2, 48, 2, 1, scale);
-                pixel(g, skinDeep, ox, oy, 1, 53, 1, 2, scale);
-                pixel(g, skinDeep, ox, oy, 3, 53, 1, 2, scale);
-                pixel(g, skinDeep, ox, oy, 5, 52, 1, 2, scale);
-            } else {
-                pixel(g, outline, ox, oy, 27, 27, 6, 13, scale);
-                pixel(g, outline, ox, oy, 29, 38, 6, 12, scale);
-                pixel(g, shirtDeep, ox, oy, 28, 28, 4, 11, scale);
-                pixel(g, shirt, ox, oy, 28, 28, 3, 9, scale);
-                pixel(g, shirtLight, ox, oy, 30, 29, 1, 6, scale);
-                pixel(g, skinDeep, ox, oy, 30, 39, 4, 10, scale);
-                pixel(g, skin, ox, oy, 30, 39, 3, 9, scale);
-                pixel(g, skinLight, ox, oy, 32, 40, 1, 5, scale);
-                pixel(g, outline, ox, oy, 30, 48, 7, 6, scale);
-                pixel(g, skinDark, ox, oy, 31, 48, 5, 5, scale);
-                pixel(g, skin, ox, oy, 31, 48, 4, 3, scale);
-                pixel(g, skinLight, ox, oy, 34, 48, 1, 1, scale);
-                pixel(g, skinDeep, ox, oy, 31, 52, 1, 2, scale);
-                pixel(g, skinDeep, ox, oy, 33, 53, 1, 2, scale);
-                pixel(g, skinDeep, ox, oy, 35, 53, 1, 2, scale);
-            }
-        }
-
-        private void pixel(Graphics2D g, Color color, int ox, int oy,
-                           int x, int y, int width, int height, int scale) {
-            g.setColor(color);
-            g.fillRect(ox + x * scale, oy + y * scale, width * scale, height * scale);
         }
 
         private void paintColorReaction(Graphics2D g, int x, int y, int type) {

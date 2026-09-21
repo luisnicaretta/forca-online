@@ -94,7 +94,8 @@ public class Client {
                     System.out.println(f.length > 2 && f[2].equals("RECONNECTED")
                             ? "Reconectado. Recuperando a partida..." : "Conectado ao servidor.");
                 }
-                case "WAITING" -> System.out.println("Sala de espera: aguardando outro jogador...");
+                case "WAITING" -> System.out.println(f.length > 2 ? dec(f[2])
+                        : "Sala de espera: aguardando outro jogador...");
                 case "STATE" -> renderState(f);
                 case "ERROR" -> System.out.println("AVISO: " + dec(f[1]));
                 case "PONG" -> { }
