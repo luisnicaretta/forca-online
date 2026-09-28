@@ -3,3 +3,7 @@
 .vagrant/
 .idea/
 .vscode/
+build-test/
+*.db
+*.db-shm
+*.db-wal

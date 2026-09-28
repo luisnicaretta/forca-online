@@ -1,0 +1,7 @@
+FROM python:3.12-slim
+WORKDIR /app
+COPY database/db_service.py /app/db_service.py
+RUN mkdir -p /data
+VOLUME ["/data"]
+EXPOSE 8080
+ENTRYPOINT ["python", "/app/db_service.py"]

@@ -238,13 +238,7 @@ public class GameLauncher {
             setBusy(true, "Conectando ao servidor...");
             new SwingWorker<List<Address>, Void>() {
                 @Override protected List<Address> doInBackground() throws Exception {
-                    List<Address> addresses = Address.parseList(servers);
-                    Address first = addresses.get(0);
-                    if (first.isLocal() && !LocalCluster.isPortOpen(first.port, 250)) {
-                        LocalCluster.ensureRunning();
-                        return Address.parseList("127.0.0.1:5050,127.0.0.1:5052");
-                    }
-                    return addresses;
+                    return Address.parseList(servers);
                 }
 
                 @Override protected void done() {
@@ -288,6 +282,7 @@ public class GameLauncher {
         final JLabel letters = label("Letras usadas: nenhuma", 13, MUTED, Font.PLAIN);
         final JLabel message = label("Aguardando servidor...", 15, TEXT, Font.BOLD);
         final JLabel turn = label("", 14, GOLD, Font.BOLD);
+        final JLabel turnTimer = label("TEMPO RESTANTE: --:--", 18, GREEN, Font.BOLD);
         final JTextField wholeWordInput = input("");
         final JButton wordGuessButton = new GameActionButton("ADIVINHAR PALAVRA", GOLD, BG);
         final JButton replayButton = new GameActionButton("JOGAR DE NOVO", GREEN, BG);
@@ -304,6 +299,11 @@ public class GameLauncher {
         volatile String currentMatchId = "";
         volatile boolean replayRequested;
         volatile int serverIndex;
+        volatile int configuredTurnTimeoutSeconds = 120;
+        volatile long serverRemainingMillis = -1L;
+        volatile long stateReceivedAtNanos = System.nanoTime();
+        volatile String currentTurnToken = "-";
+        final javax.swing.Timer countdownTimer;
         Thread networkThread;
         JPanel wordGuessPanel;
 
@@ -316,6 +316,8 @@ public class GameLauncher {
             setMinimumSize(new Dimension(940, 680));
             setLocationRelativeTo(null);
             setContentPane(build(mode));
+            countdownTimer = new javax.swing.Timer(200, e -> refreshTurnTimer());
+            countdownTimer.start();
             addWindowListener(new WindowAdapter() {
                 @Override public void windowClosed(WindowEvent e) { close(); }
             });
@@ -350,7 +352,7 @@ public class GameLauncher {
             gameArea.setBorder(new EmptyBorder(16, 22, 18, 22));
             gameArea.setLayout(new BoxLayout(gameArea, BoxLayout.Y_AXIS));
             word.setFont(new Font(Font.MONOSPACED, Font.BOLD, 34));
-            for (JLabel item : List.of(category, word, letters, message, turn)) item.setAlignmentX(Component.CENTER_ALIGNMENT);
+            for (JLabel item : List.of(category, word, letters, message, turn, turnTimer)) item.setAlignmentX(Component.CENTER_ALIGNMENT);
             gameArea.add(category);
             gameArea.add(Box.createVerticalStrut(5));
             gameArea.add(word);
@@ -360,6 +362,8 @@ public class GameLauncher {
             gameArea.add(message);
             gameArea.add(Box.createVerticalStrut(4));
             gameArea.add(turn);
+            gameArea.add(Box.createVerticalStrut(4));
+            gameArea.add(turnTimer);
             gameArea.add(Box.createVerticalStrut(8));
             gameArea.add(buildWordGuessPanel());
             replayButton.setAlignmentX(Component.CENTER_ALIGNMENT);
@@ -439,6 +443,8 @@ public class GameLauncher {
                         gameFinished = false;
                         replayRequested = false;
                         myTurn = false;
+                        currentTurnToken = "-";
+                        serverRemainingMillis = -1L;
                         String waitingInfo = f.length > 2 ? dec(f[2]) : "Você está na sala de espera.";
                         SwingUtilities.invokeLater(() -> {
                             currentMatchId = "";
@@ -447,6 +453,8 @@ public class GameLauncher {
                             message.setText(waitingInfo);
                             message.setForeground(TEXT);
                             turn.setText("Aguardando o segundo jogador...");
+                            turnTimer.setText("TEMPO: AGUARDANDO PARTIDA");
+                            turnTimer.setForeground(MUTED);
                             setGuessControlsEnabled(false);
                         });
                     }
@@ -479,9 +487,22 @@ public class GameLauncher {
             long version = Long.parseLong(f[12]);
             String secretWord = dec(f[13]);
             String categoryName = f.length >= 15 ? dec(f[14]) : "GERAL";
+            int timeoutSeconds = f.length >= 16 ? Integer.parseInt(f[15]) : 120;
+            long remainingMillis = f.length >= 17
+                    ? Long.parseLong(f[16])
+                    : (status.equals("PLAYING") && timeoutSeconds > 0 ? timeoutSeconds * 1000L : -1L);
+            String p1Token = f.length >= 19 ? f[17] : (p1Name.equalsIgnoreCase(name) ? token : "-");
+            String p2Token = f.length >= 19 ? f[18] : (p2Name.equalsIgnoreCase(name) ? token : "-");
+            String replayTokens = f.length >= 20 ? dec(f[19]) : "";
+            String actorToken = f.length >= 21 ? f[20] : "-";
             myTurn = status.equals("PLAYING") && token.equals(turnToken);
             gameFinished = status.equals("FINISHED");
             usedLetters = used;
+            configuredTurnTimeoutSeconds = timeoutSeconds;
+            serverRemainingMillis = remainingMillis;
+            stateReceivedAtNanos = System.nanoTime();
+            currentTurnToken = turnToken;
+            boolean serverSaysReplayRequested = Arrays.asList(replayTokens.split(",", -1)).contains(token);
 
             SwingUtilities.invokeLater(() -> {
                 if (!matchId.equals(currentMatchId)) {
@@ -496,18 +517,19 @@ public class GameLauncher {
                 letters.setText("Letras usadas: " + (used.isBlank() ? "nenhuma" : used));
                 message.setText(info);
                 message.setForeground(gameFinished ? (winnerToken.equals(token) ? GREEN : RED) : TEXT);
-                player1.update(p1Name, p1Errors, p1Name.equalsIgnoreCase(name));
-                player2.update(p2Name, p2Errors, p2Name.equalsIgnoreCase(name));
-                if (version > lastDisplayedVersion && info.startsWith(p1Name + " acertou")) {
-                    player1.showTaunt();
-                } else if (version > lastDisplayedVersion && info.startsWith(p2Name + " acertou")) {
-                    player2.showTaunt();
+                player1.update(p1Name, p1Errors, p1Token.equals(token));
+                player2.update(p2Name, p2Errors, p2Token.equals(token));
+                if (version > lastDisplayedVersion && info.contains(" acertou")) {
+                    if (actorToken.equals(p1Token)) player1.showTaunt();
+                    else if (actorToken.equals(p2Token)) player2.showTaunt();
                 }
                 lastDisplayedVersion = Math.max(lastDisplayedVersion, version);
                 if (gameFinished) {
                     word.setText(secretWord.replace("", " ").trim());
                     turn.setText(winnerToken.equals(token) ? "VOCÊ VENCEU!" : "VOCÊ PERDEU");
                     wordGuessPanel.setVisible(false);
+                    replayRequested = serverSaysReplayRequested;
+                    replayButton.setText(replayRequested ? "AGUARDANDO ADVERSÁRIO..." : "JOGAR DE NOVO");
                     replayButton.setVisible(true);
                     replayButton.setEnabled(!replayRequested);
                 } else {
@@ -515,12 +537,47 @@ public class GameLauncher {
                     wordGuessPanel.setVisible(true);
                     replayButton.setVisible(false);
                 }
+                refreshTurnTimer();
                 refreshKeyboard();
             });
         }
 
+        private long currentRemainingMillis() {
+            if (configuredTurnTimeoutSeconds <= 0 || serverRemainingMillis < 0) return -1L;
+            long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - stateReceivedAtNanos);
+            return Math.max(0L, serverRemainingMillis - elapsedMillis);
+        }
+
+        private void refreshTurnTimer() {
+            if (gameFinished) {
+                turnTimer.setText("TEMPO ENCERRADO");
+                turnTimer.setForeground(MUTED);
+                return;
+            }
+            if (currentMatchId.isEmpty() || currentTurnToken.equals("-")) {
+                turnTimer.setText("TEMPO: AGUARDANDO PARTIDA");
+                turnTimer.setForeground(MUTED);
+                return;
+            }
+            if (configuredTurnTimeoutSeconds <= 0 || serverRemainingMillis < 0) {
+                turnTimer.setText("TEMPO POR TURNO: SEM LIMITE");
+                turnTimer.setForeground(GREEN);
+                return;
+            }
+
+            long remainingMillis = currentRemainingMillis();
+            long totalSeconds = (remainingMillis + 999L) / 1000L;
+            long minutes = totalSeconds / 60L;
+            long seconds = totalSeconds % 60L;
+            String owner = token.equals(currentTurnToken) ? "SEU TEMPO" : "TEMPO DO ADVERSÁRIO";
+            turnTimer.setText(String.format(Locale.ROOT, "%s: %02d:%02d", owner, minutes, seconds));
+            turnTimer.setForeground(totalSeconds <= 10 ? RED : (totalSeconds <= 30 ? GOLD : GREEN));
+
+            if (remainingMillis == 0 && myTurn) setGuessControlsEnabled(false);
+        }
+
         private void sendGuess(char letter) {
-            if (!myTurn || gameFinished) return;
+            if (!myTurn || gameFinished || (configuredTurnTimeoutSeconds > 0 && currentRemainingMillis() <= 0)) return;
             PrintWriter out = writer.get();
             if (out != null) out.println("GUESS|" + enc(String.valueOf(letter)));
             setGuessControlsEnabled(false);
@@ -528,7 +585,7 @@ public class GameLauncher {
 
         private void sendWordGuess() {
             String attempt = wholeWordInput.getText().trim();
-            if (!myTurn || gameFinished || attempt.length() < 2) {
+            if (!myTurn || gameFinished || (configuredTurnTimeoutSeconds > 0 && currentRemainingMillis() <= 0) || attempt.length() < 2) {
                 if (attempt.length() < 2) message.setText("Digite a palavra completa antes de enviar.");
                 return;
             }
@@ -555,9 +612,11 @@ public class GameLauncher {
             for (Map.Entry<Character, JButton> entry : keyboard.entrySet()) {
                 boolean alreadyUsed = used.contains(entry.getKey());
                 if (entry.getValue() instanceof LetterButton letterButton) letterButton.setUsed(alreadyUsed);
-                entry.getValue().setEnabled(myTurn && !gameFinished && !alreadyUsed && writer.get() != null);
+                boolean timeAvailable = configuredTurnTimeoutSeconds <= 0 || currentRemainingMillis() > 0;
+                entry.getValue().setEnabled(myTurn && !gameFinished && timeAvailable && !alreadyUsed && writer.get() != null);
             }
-            boolean canGuess = myTurn && !gameFinished && writer.get() != null;
+            boolean timeAvailable = configuredTurnTimeoutSeconds <= 0 || currentRemainingMillis() > 0;
+            boolean canGuess = myTurn && !gameFinished && timeAvailable && writer.get() != null;
             wholeWordInput.setEnabled(canGuess);
             wordGuessButton.setEnabled(canGuess);
         }
@@ -580,6 +639,7 @@ public class GameLauncher {
 
         private void close() {
             running.set(false);
+            countdownTimer.stop();
             PrintWriter out = writer.get();
             if (out != null) out.println("QUIT");
         }

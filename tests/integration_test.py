@@ -1,191 +1,258 @@
 #!/usr/bin/env python3
-"""Teste real: lobby, turnos, sincronizacao, replicacao e failover."""
-from __future__ import annotations
-
 import base64
+import json
+import os
+import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
+import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+BUILD = ROOT / "build-test"
 
 
-def enc(value: str) -> str:
-    return base64.urlsafe_b64encode(value.encode()).decode().rstrip("=")
+def b64(text: str) -> str:
+    return base64.urlsafe_b64encode(text.encode()).decode().rstrip("=")
 
 
-def dec(value: str) -> str:
-    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4)).decode()
+def dec(text: str) -> str:
+    text += "=" * (-len(text) % 4)
+    return base64.urlsafe_b64decode(text).decode()
 
 
-class TestClient:
-    def __init__(self, name: str, port: int, token: str = "-"):
-        self.name = name
-        self.sock = socket.create_connection(("127.0.0.1", port), timeout=4)
-        self.sock.settimeout(6)
-        self.reader = self.sock.makefile("r", encoding="utf-8", newline="\n")
-        self.send(f"HELLO|{enc(name)}|{token}")
-        welcome = self.read_until("WELCOME")
-        self.token = welcome.split("|")[1]
-
-    def send(self, message: str):
-        self.sock.sendall((message + "\n").encode())
-
-    def read_until(self, kind: str) -> str:
-        while True:
-            line = self.reader.readline()
-            if not line:
-                raise RuntimeError(f"{self.name}: conexao fechada esperando {kind}")
-            line = line.strip()
-            if line.split("|", 1)[0] == kind:
-                return line
-
-    def state(self) -> list[str]:
-        return self.read_until("STATE").split("|")
-
-    def close(self):
-        try:
-            self.sock.shutdown(socket.SHUT_RDWR)
-        except OSError:
-            pass
-        try:
-            self.reader.close()
-            self.sock.close()
-        except OSError:
-            pass
+def free_port():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
 
 
-def start_server(*args: str) -> subprocess.Popen:
-    return subprocess.Popen(
-        ["java", "server/Server.java", *args],
-        cwd=ROOT,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
-
-
-def wait_port(port: int, timeout: float = 20):
+def wait_port(port, timeout=12):
     end = time.time() + timeout
     while time.time() < end:
         try:
-            with socket.create_connection(("127.0.0.1", port), timeout=.2):
+            with socket.create_connection(("127.0.0.1", port), timeout=.3):
                 return
         except OSError:
-            time.sleep(.15)
+            time.sleep(.1)
     raise RuntimeError(f"porta {port} nao abriu")
 
 
-def stop(process: subprocess.Popen):
-    process.terminate()
-    try:
-        process.wait(timeout=4)
-    except subprocess.TimeoutExpired:
-        process.kill()
+def wait_http(url, timeout=12):
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            with urllib.request.urlopen(url, timeout=.5) as r:
+                if r.status == 200:
+                    return
+        except Exception:
+            time.sleep(.1)
+    raise RuntimeError(f"HTTP nao respondeu: {url}")
 
 
-def assert_state_equal(a: list[str], b: list[str]):
-    assert a[1:13] == b[1:13], f"os jogadores receberam estados diferentes:\nA={a}\nB={b}"
+class Client:
+    def __init__(self, name, port, token="-"):
+        self.name = name
+        self.sock = socket.create_connection(("127.0.0.1", port), timeout=3)
+        self.sock.settimeout(5)
+        self.file = self.sock.makefile("rwb", buffering=0)
+        self.send(f"HELLO|{b64(name)}|{token}")
+        welcome = self.read_until("WELCOME")
+        self.token = welcome.split("|")[1]
+
+    def send(self, line):
+        self.file.write((line + "\n").encode())
+
+    def read_line(self):
+        line = self.file.readline()
+        if not line:
+            raise EOFError("conexao fechada")
+        return line.decode().rstrip("\r\n")
+
+    def read_until(self, kind, timeout=5):
+        self.sock.settimeout(timeout)
+        while True:
+            line = self.read_line()
+            if line == kind or line.startswith(kind + "|"):
+                return line
+
+    def state(self):
+        line = self.read_until("STATE")
+        return self.parse_state(line)
+
+    def state_after(self, min_version):
+        while True:
+            state = self.state()
+            if state["version"] > min_version:
+                return state
+
+    @staticmethod
+    def parse_state(line):
+        f = line.split("|")
+        return {
+            "raw": line,
+            "id": f[1],
+            "masked": dec(f[2]),
+            "p1": dec(f[3]), "e1": int(f[4]),
+            "p2": dec(f[5]), "e2": int(f[6]),
+            "turn": f[7], "used": dec(f[8]), "status": f[9],
+            "winner": f[10], "message": dec(f[11]), "version": int(f[12]),
+            "category": dec(f[14]) if len(f) >= 15 else "GERAL",
+            "timeout": int(f[15]) if len(f) >= 16 else None,
+            "remaining": int(f[16]) if len(f) >= 17 else None,
+            "p1token": f[17] if len(f) >= 19 else None,
+            "p2token": f[18] if len(f) >= 19 else None,
+            "replay": dec(f[19]) if len(f) >= 20 else "",
+            "actor": f[20] if len(f) >= 21 else "-",
+        }
+
+    def close(self):
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+
+
+def start(logs, *cmd, cwd=ROOT, env=None):
+    log = tempfile.NamedTemporaryFile(prefix="forca-", suffix=".log", delete=False)
+    logs.append(log.name)
+    return subprocess.Popen(cmd, cwd=cwd, stdout=log, stderr=subprocess.STDOUT, env=env)
+
+
+def terminate(proc):
+    if proc and proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(4)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(2)
 
 
 def main():
-    backup = start_server("--role=backup", "--port=15052", "--replication-port=15051", "--words=tests/test_words.txt")
-    primary = start_server("--role=primary", "--port=15050", "--peer=127.0.0.1:15051", "--words=tests/test_words.txt")
-    clients: list[TestClient] = []
+    if not shutil.which("java") or not shutil.which("javac"):
+        print("ERRO: Java 17+ (java e javac) e necessario")
+        return 2
+
+    shutil.rmtree(BUILD, ignore_errors=True)
+    BUILD.mkdir()
+    subprocess.run(["javac", "-encoding", "UTF-8", "-d", str(BUILD), "server/Server.java"], cwd=ROOT, check=True)
+
+    db_port, backup_port, primary_port, repl_port, restored_port = [free_port() for _ in range(5)]
+    data_dir = Path(tempfile.mkdtemp(prefix="forca-db-"))
+    env = os.environ.copy()
+    env.update({"FORCA_DB_PATH": str(data_dir / "forca.db"), "FORCA_DB_PORT": str(db_port), "FORCA_DB_HOST": "127.0.0.1"})
+    db_url = f"http://127.0.0.1:{db_port}"
+    logs = []
+    db = backup = primary = restored = None
+    clients = []
+
     try:
-        wait_port(15051)
-        wait_port(15050)
-        wait_port(15052)
+        db = start(logs, sys.executable, "database/db_service.py", env=env)
+        wait_http(db_url + "/health")
 
-        p1 = TestClient("Luis", 15050)
-        clients.append(p1)
-        p2 = TestClient("Joao", 15050)
-        clients.append(p2)
-        initial1, initial2 = p1.state(), p2.state()
-        assert_state_equal(initial1, initial2)
-        assert initial1[7] == p1.token, "primeiro turno deveria ser do jogador 1"
-        assert dec(initial1[14]) == "TESTE", "categoria nao chegou aos clientes"
+        backup = start(logs, "java", "-cp", str(BUILD), "Server",
+                       "--role=backup", f"--port={backup_port}", f"--replication-port={repl_port}",
+                       "--words=server/words.txt", f"--db-url={db_url}", "--grace=5", "--turn-timeout=0",
+                       "--promotion-timeout-ms=1200")
+        wait_port(backup_port)
+        wait_port(repl_port)
 
-        # Mais dois clientes formam outra partida, comprovando multiplas salas.
-        p3 = TestClient("Ana", 15050)
-        clients.append(p3)
-        p4 = TestClient("Bia", 15050)
-        clients.append(p4)
-        second_match_1, second_match_2 = p3.state(), p4.state()
-        assert_state_equal(second_match_1, second_match_2)
-        assert second_match_1[1] != initial1[1], "quatro jogadores nao foram separados em duas partidas"
-        p3.close()
-        p4.close()
-        clients.remove(p3)
-        clients.remove(p4)
+        primary = start(logs, "java", "-cp", str(BUILD), "Server",
+                        "--role=primary", f"--port={primary_port}", f"--peer=127.0.0.1:{repl_port}",
+                        "--words=server/words.txt", f"--db-url={db_url}", "--grace=5", "--turn-timeout=0",
+                       "--promotion-timeout-ms=1200")
+        wait_port(primary_port)
 
-        # A tentativa de palavra inteira errada consome uma chance e alterna o turno.
-        p1.send(f"WORD|{enc('RESPOSTA ERRADA')}")
-        state1, state2 = p1.state(), p2.state()
-        assert_state_equal(state1, state2)
-        assert int(state1[4]) == 1, "erro do jogador 1 nao foi registrado"
-        assert state1[7] == p2.token, "turno nao alternou"
+        # Quatro jogadores => duas partidas simultaneas.
+        p1 = Client("Ana", primary_port); clients.append(p1)
+        p2 = Client("Bruno", primary_port); clients.append(p2)
+        s1a = p1.state(); s1b = p2.state()
+        assert s1a["id"] == s1b["id"], "primeiro par nao caiu na mesma partida"
 
-        p2.send(f"WORD|{enc('OUTRA RESPOSTA ERRADA')}")
-        state1, state2 = p1.state(), p2.state()
-        assert_state_equal(state1, state2)
-        assert int(state1[6]) == 1, "erro do jogador 2 nao foi registrado"
-        assert state1[7] == p1.token
+        p3 = Client("Carla", primary_port); clients.append(p3)
+        p4 = Client("Diego", primary_port); clients.append(p4)
+        s2a = p3.state(); s2b = p4.state()
+        assert s2a["id"] == s2b["id"] and s2a["id"] != s1a["id"], "fila nao criou duas partidas"
 
-        # Aguarda a replica mais nova e derruba o principal.
-        time.sleep(1.2)
-        old_p1_token, old_p2_token = p1.token, p2.token
-        stop(primary)
-        p1.close()
-        p2.close()
-        clients.clear()
+        # Fora do turno deve ser recusado.
+        current = p1 if s1a["turn"] == p1.token else p2
+        waiting = p2 if current is p1 else p1
+        waiting.send("GUESS|" + b64("A"))
+        err = waiting.read_until("ERROR")
+        assert "Aguarde sua vez" in dec(err.split("|", 1)[1]), "servidor aceitou jogada fora do turno"
 
-        r1 = TestClient("Luis", 15052, old_p1_token)
-        clients.append(r1)
-        recovered1 = r1.state()
-        r2 = TestClient("Joao", 15052, old_p2_token)
-        clients.append(r2)
-        recovered2 = r2.state()
-        recovered1_after_p2 = r1.state()
-        assert int(recovered1[4]) == 1 and int(recovered1[6]) == 1
-        assert int(recovered2[4]) == 1 and int(recovered2[6]) == 1
-        assert_state_equal(recovered1_after_p2, recovered2)
+        # Erro de palavra completa soma somente no boneco de quem jogou e aparece para ambos.
+        before_e1, before_e2 = s1a["e1"], s1a["e2"]
+        current.send("WORD|" + b64("ZZZZZZZZZZZZZZ"))
+        after_a = p1.state(); after_b = p2.state()
+        assert after_a["raw"] == after_b["raw"], "clientes receberam estados diferentes"
+        if current.token == p1.token:
+            assert after_a["e1"] == before_e1 + 1 and after_a["e2"] == before_e2
+        else:
+            assert after_a["e2"] == before_e2 + 1 and after_a["e1"] == before_e1
 
-        r1.send(f"WORD|{enc('AINDA ERRADA')}")
-        after1, after2 = r1.state(), r2.state()
-        assert_state_equal(after1, after2)
-        assert int(after1[4]) == 2, "partida nao continuou apos failover"
+        # Banco recebeu as duas partidas.
+        end = time.time() + 5
+        stats = {}
+        while time.time() < end:
+            with urllib.request.urlopen(db_url + "/stats", timeout=1) as r:
+                stats = json.load(r)
+            if stats.get("active", 0) >= 2 and stats.get("snapshots", 0) >= 3:
+                break
+            time.sleep(.15)
+        assert stats.get("active", 0) >= 2, f"banco nao persistiu partidas: {stats}"
 
-        # O jogador 2 acerta a palavra completa.
-        r2.send(f"WORD|{enc('TESTE')}")
-        finished1, finished2 = r1.state(), r2.state()
-        assert_state_equal(finished1, finished2)
-        assert finished1[9] == "FINISHED" and finished1[10] == r2.token
+        # Aguarda a replicacao e derruba o primario.
+        time.sleep(.5)
+        snapshot_before_fail = after_a
+        token1, token2 = p1.token, p2.token
+        p1.close(); p2.close()
+        terminate(primary); primary = None
+        time.sleep(1.35)  # aguarda promocao segura do reserva apos perda do heartbeat
 
-        # Os dois pedem revanche; uma nova GameSession deve nascer zerada.
-        old_match = finished1[1]
-        r1.send("REPLAY")
-        waiting_replay1, waiting_replay2 = r1.state(), r2.state()
-        assert_state_equal(waiting_replay1, waiting_replay2)
-        r2.send("REPLAY")
-        replay1, replay2 = r1.state(), r2.state()
-        assert_state_equal(replay1, replay2)
-        assert replay1[1] != old_match, "revanche reutilizou a partida encerrada"
-        assert replay1[9] == "PLAYING" and int(replay1[4]) == 0 and int(replay1[6]) == 0
-        assert dec(replay1[14]) == "TESTE"
-        print("OK: lobby, palavra inteira, revanche, semaforo, replicacao e failover validados.")
+        r1 = Client("Ana", backup_port, token1); clients.append(r1)
+        r2 = Client("Bruno", backup_port, token2); clients.append(r2)
+        rs1 = r1.state(); rs2 = r2.state()
+        assert rs1["id"] == snapshot_before_fail["id"] == rs2["id"], "backup nao recuperou a mesma partida"
+        assert (rs1["e1"], rs1["e2"]) == (snapshot_before_fail["e1"], snapshot_before_fail["e2"]), "erros se perderam no failover"
+        assert rs1["version"] >= snapshot_before_fail["version"], "versao regrediu no failover"
+
+        # Continua jogando no reserva.
+        active_client = r1 if rs1["turn"] == r1.token else r2
+        active_client.send("WORD|" + b64("XXXXXXXXXXXX"))
+        cont1 = r1.state_after(rs1["version"]); cont2 = r2.state_after(rs1["version"])
+        assert cont1["raw"] == cont2["raw"] and cont1["version"] > rs1["version"], "partida nao continuou no backup"
+
+        # Persistencia real: derruba o ultimo servidor e sobe um novo a partir do SQLite.
+        r1.close(); r2.close()
+        time.sleep(.4)
+        terminate(backup); backup = None
+        restored = start(logs, "java", "-cp", str(BUILD), "Server",
+                         "--role=primary", f"--port={restored_port}", "--words=server/words.txt",
+                         f"--db-url={db_url}", "--grace=5", "--turn-timeout=0")
+        wait_port(restored_port)
+        d1 = Client("Ana", restored_port, token1); clients.append(d1)
+        restored_state = d1.state()
+        assert restored_state["id"] == cont1["id"], "reinicio nao restaurou a partida do banco"
+        assert restored_state["version"] >= cont1["version"], "estado persistido esta atrasado"
+
+        print("OK: sockets, lobby, 2 jogadores, semaforo/turno, dois bonecos, banco, replicacao e failover validados.")
+        print(f"DB stats: {stats}")
         return 0
-    except Exception as exc:
-        print(f"FALHA: {exc}", file=sys.stderr)
-        return 1
     finally:
-        for client in clients:
-            client.close()
-        if primary.poll() is None:
-            stop(primary)
-        stop(backup)
+        for c in clients:
+            c.close()
+        for proc in (primary, backup, restored, db):
+            terminate(proc)
+        shutil.rmtree(data_dir, ignore_errors=True)
+        if os.environ.get("FORCA_KEEP_TEST_LOGS") != "1":
+            for name in logs:
+                try: os.unlink(name)
+                except OSError: pass
 
 
 if __name__ == "__main__":

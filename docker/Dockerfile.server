@@ -1,0 +1,11 @@
+FROM eclipse-temurin:17-jdk-jammy AS build
+WORKDIR /app
+COPY server/Server.java /app/server/Server.java
+RUN mkdir -p /app/build && javac -encoding UTF-8 -d /app/build /app/server/Server.java
+
+FROM eclipse-temurin:17-jre-jammy
+WORKDIR /app
+COPY --from=build /app/build /app/build
+COPY server/words.txt /app/server/words.txt
+EXPOSE 5050 5051
+ENTRYPOINT ["java", "-cp", "/app/build", "Server"]

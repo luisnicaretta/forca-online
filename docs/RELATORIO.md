@@ -2,118 +2,160 @@
 
 ## 1. Objetivo
 
-O sistema implementa um jogo da forca em arquitetura cliente/servidor. Vários jogadores podem se conectar ao mesmo servidor, mas cada partida possui apenas duas pessoas. O servidor é a autoridade sobre palavra, turno, letras usadas, erros e resultado, impedindo que os clientes alterem o estado localmente.
+O sistema implementa um jogo da forca em arquitetura cliente/servidor. Vários jogadores podem se conectar simultaneamente, mas cada partida possui exatamente dois participantes. O servidor é a autoridade sobre palavra, turno, letras utilizadas, erros, resultado e revanche.
+
+A solução inclui alta disponibilidade, reconexão de clientes, replicação de estado e persistência SQLite.
 
 ## 2. Arquitetura
 
+### 2.1 Docker
+
 ```mermaid
 flowchart TD
-    C1[Cliente 1] --> VIP[IP virtual]
-    C2[Cliente 2] --> VIP
-    VIP --> P[VM principal]
-    P -->|snapshots| B[VM reserva]
-    P --> L[Sala de espera]
-    L --> G1[Partida A]
-    L --> G2[Partida B]
+    C1[Cliente 1] --> H[HAProxy :5050]
+    C2[Cliente 2] --> H
+    CN[Cliente N] --> H
+    H -->|normal| P[Servidor primary]
+    H -->|falha do primary| B[Servidor backup]
+    P -->|SYNC snapshots| B
+    P --> D[Serviço de persistência]
+    B --> D
+    D --> S[(SQLite / volume Docker)]
 ```
 
-O Keepalived anuncia o IP virtual na VM principal. Se ela parar, a VM reserva passa a anunciar o mesmo endereço. Como conexões TCP abertas não migram entre máquinas, o cliente possui reconexão automática. O token recebido no primeiro acesso identifica o jogador e permite ligá-lo à partida replicada.
+O cliente usa um único endpoint. Quando o principal cai, a conexão TCP existente termina e o cliente reconecta. O HAProxy direciona a nova conexão ao reserva.
 
-## 3. Componentes
+### 2.2 VMs
 
-### Servidor
+A alternativa com Vagrant/VirtualBox utiliza Keepalived/VRRP e um IP virtual `192.168.56.100`. O comportamento da aplicação é o mesmo: após a queda da conexão, o cliente reconecta e apresenta o token anterior.
 
-`GameServer` aceita conexões, mantém jogadores por token e executa a sala de espera. Cada cliente é atendido por uma tarefa do `ExecutorService`.
+## 3. Servidor e concorrência
 
-`BlockingQueue<Player>` funciona como fila segura entre threads. O emparelhador retira dois jogadores conectados e cria uma `GameSession`.
+`GameServer` aceita conexões e executa cada cliente em uma tarefa do `ExecutorService`.
 
-### Partida
+A sala de espera utiliza `BlockingQueue<Player>`. O emparelhador escolhe dois jogadores válidos e cria uma `GameSession`.
 
-A partida armazena:
+Cada partida mantém:
 
-- palavra secreta;
-- dois jogadores e seus tokens;
-- contador de erros de cada jogador;
+- palavra e categoria;
+- dois jogadores/tokens;
+- erros separados;
 - letras já utilizadas;
-- jogador da vez;
-- situação e vencedor;
-- versão monotônica do estado.
+- índice do turno;
+- status e vencedor;
+- versão monotônica;
+- instante de início do turno.
 
-O método `guess` chama `semaphore.acquire()` antes de validar e modificar qualquer dado. O bloco `finally` sempre chama `semaphore.release()`. Mesmo se duas requisições chegarem juntas por threads distintas, a região crítica é executada por apenas uma delas de cada vez.
+## 4. Semáforo
 
-### Cliente
+Cada `GameSession` possui `Semaphore(1, true)`. Os métodos que modificam o estado adquirem o semáforo antes de validar e executar a jogada e liberam no `finally`.
 
-O `GameLauncher.java` oferece uma interface Swing com dois modos. No online, dois clientes gráficos reais entram na sala de espera. No solo, o programa conecta o humano e inicia um `BotClient` como segundo cliente. Ambos utilizam o mesmo protocolo TCP. Ao receber `STATE`, a interface redesenha palavra, letras utilizadas, os dois bonecos e a indicação do turno.
+Além da exclusão mútua, o servidor testa se o emissor é `players[turnIndex]`. Uma requisição recebida fora do turno não modifica o estado e recebe `ERROR`.
 
-O banco de palavras contém 156 opções em 13 categorias. Palavra e categoria são escolhidas no servidor, incluídas no snapshot de replicação e enviadas aos clientes. A interface também apresenta perfis visuais; uma jogada correta aciona temporariamente um emoji no perfil do autor do acerto.
+O `ReentrantLock stateLock` protege a montagem e transmissão do snapshot para impedir leitura concorrente inconsistente.
 
-O bot não acessa diretamente a `GameSession`: ele recebe estados e envia `GUESS` pelo socket. Portanto, a região crítica do semáforo, o limite de dois jogadores e as validações de turno continuam sendo exercitados no modo solo.
+## 5. Estado e dois bonecos
 
-## 4. Protocolo
+Os dois jogadores possuem contadores independentes de erro. Uma jogada incorreta incrementa somente `player.errors` do autor da jogada.
 
-O protocolo é textual, com uma mensagem por linha. Textos livres são codificados em Base64 URL-safe para que nomes, espaços e acentos não quebrem o separador `|`.
+Depois da alteração, `broadcast` monta uma única mensagem `STATE` contendo os dois nomes e os dois contadores e envia exatamente esse estado aos dois clientes. Por isso, ambos enxergam os dois bonecos, mas somente o boneco do jogador que errou avança.
+
+## 6. Protocolo
+
+O protocolo é textual, uma mensagem por linha. Campos livres usam Base64 URL-safe.
 
 | Direção | Mensagem | Finalidade |
 |---|---|---|
-| cliente → servidor | `HELLO|nomeBase64|token` | entrar ou reconectar |
-| servidor → cliente | `WELCOME|token|NEW` | entregar identidade |
-| servidor → cliente | `WAITING|posição` | informar sala de espera |
-| cliente → servidor | `GUESS|letraBase64` | enviar jogada |
-| cliente → servidor | `WORD|palavraBase64` | tentar a palavra completa |
-| cliente → servidor | `REPLAY` | solicitar uma revanche |
-| servidor → ambos | `STATE|...` | sincronizar toda a partida |
-| cliente → servidor | `QUIT` | sair |
-| principal → reserva | `SYNC|segredo|snapshot` | replicar estado |
+| cliente -> servidor | `HELLO|nomeBase64|token` | entrar/reconectar |
+| servidor -> cliente | `WELCOME|token|NEW` | identidade |
+| servidor -> cliente | `WAITING|...` | sala de espera |
+| cliente -> servidor | `GUESS|letraBase64` | letra |
+| cliente -> servidor | `WORD|palavraBase64` | palavra inteira |
+| cliente -> servidor | `REPLAY` | revanche |
+| cliente -> servidor | `QUIT` | abandono |
+| servidor -> ambos | `STATE|...` | estado completo |
+| primary -> backup | `SYNC|segredo|snapshot` | replicação |
 
-## 5. Regras da partida
+## 7. Alta disponibilidade
 
-1. O primeiro jogador retirado da fila começa.
-2. Somente uma letra inédita é aceita por jogada.
-3. Após uma jogada válida, o turno passa ao adversário.
-4. Um acerto revela a letra compartilhada da palavra.
-5. Um erro acrescenta uma parte somente ao boneco de quem errou.
-6. Ambos os clientes visualizam os dois bonecos.
-7. Descobrir a última letra vence a partida.
-8. Chegar a seis erros dá a vitória ao adversário.
-9. Uma tentativa de palavra completa correta vence; uma incorreta soma um erro e alterna o turno.
-10. Uma revanche começa quando os dois jogadores enviam `REPLAY`, criando uma nova sessão zerada.
+Após cada modificação válida, o servidor cria um `GameSnapshot`. No modo primary, ele envia esse snapshot ao reserva por TCP.
 
-## 6. Resiliência
+O snapshot contém dados suficientes para reconstruir a `GameSession`: palavra, categoria, tokens, nomes, erros, letras, turno, status, vencedor e versão.
 
-Após cada mudança, o principal envia um snapshot ao reserva. O snapshot inclui a palavra, tokens, nomes, erros, letras, turno, resultado e número da versão. O reserva descarta snapshots antigos que cheguem atrasados.
+Se o primary cair:
 
-Na falha do principal:
+1. a conexão TCP dos clientes é encerrada;
+2. o cliente entra no laço automático de reconexão;
+3. o HAProxy seleciona o backup (ou, nas VMs, o Keepalived transfere o IP virtual);
+4. o cliente envia `HELLO` com seu token antigo;
+5. o reserva associa o token ao jogador replicado;
+6. envia o estado atual e a partida continua.
 
-1. Keepalived detecta a indisponibilidade.
-2. O IP virtual é assumido pela VM reserva.
-3. O cliente percebe o encerramento do socket.
-4. O cliente reconecta no IP virtual.
-5. Envia `HELLO` com o token anterior.
-6. O reserva localiza jogador e partida no estado replicado.
-7. O jogo continua do último snapshot confirmado.
+## 8. Persistência
 
-Esta solução recupera o estado da aplicação; ela não tenta migrar a conexão TCP, o que seria tecnicamente incorreto para esse cenário.
+No modo Docker, `database/db_service.py` expõe uma API HTTP local e usa SQLite.
 
-## 7. Limitações e melhorias
+### Tabelas
 
-- a replicação é assíncrona; uma queda no exato instante anterior à confirmação pode perder a última jogada;
-- o estado vive em memória e desaparece se as duas VMs forem desligadas;
-- a autenticação entre servidores usa segredo compartilhado sem TLS;
-- não existe prazo máximo por turno;
-- uma versão de produção deveria utilizar banco replicado ou log durável, TLS e monitoramento.
+`matches` mantém o último snapshot de cada partida. `snapshot_history` registra as versões recebidas para auditoria/demonstração.
 
-Essas limitações não impedem a demonstração dos requisitos, mas devem ser apresentadas com transparência.
+O Java envia os snapshots de forma assíncrona. Na inicialização, caso `--db-url` esteja configurado, o servidor consulta `/snapshots` e restaura partidas com status `PLAYING`.
+
+O jogo não depende do banco para processar uma jogada: se a persistência estiver temporariamente indisponível, a partida e a replicação continuam. Isso evita transformar o banco em requisito de disponibilidade para cada requisição.
+
+## 9. Cliente
+
+`GameLauncher.java` oferece interface Swing. Ele não escolhe palavra, não calcula vitória e não altera erros localmente. O cliente envia comandos e redesenha a tela a partir de `STATE`.
+
+A interface apresenta os dois jogadores, ambos os bonecos, categoria, palavra, letras utilizadas, mensagem e turno.
+
+O modo solo também preserva a arquitetura: o bot é um segundo cliente TCP e não acessa `GameSession` diretamente.
+
+## 10. W.O. e timeouts
+
+Um `ScheduledExecutorService` executa o watchdog:
+
+- `QUIT`: W.O. imediato;
+- desconexão além de `--grace`: W.O.;
+- jogador sem jogar além de `--turn-timeout`: W.O.;
+- durante failover, o backup só ativa essa cobrança depois de receber o primeiro cliente.
+
+## 11. Testes
+
+`tests/integration_test.py` abre sockets e processos reais e valida:
+
+- quatro jogadores;
+- duas partidas independentes;
+- dois jogadores por partida;
+- recusa fora do turno;
+- estados iguais;
+- erros individuais;
+- persistência;
+- replicação;
+- queda do primary;
+- continuidade no backup;
+- restauração a partir do SQLite após reinício dos servidores.
+
+`tests/walkover_test.py` valida timeout e abandono voluntário.
+
+`java client/GameLauncher.java --network-check` valida o cliente gráfico/bot contra servidores reais.
+
+## 12. Limitações
+
+- a replicação é assíncrona; uma queda no intervalo entre uma jogada e a entrega do snapshot pode perder a atualização mais recente;
+- o banco SQLite é persistente, mas não é um cluster de banco de dados;
+- a chave de replicação é compartilhada e não usa TLS;
+- para produção seriam recomendados TLS, autenticação forte, observabilidade e um mecanismo de consenso/log durável.
+
+Essas limitações são transparentes e não impedem a demonstração dos requisitos acadêmicos propostos.
 
 
-## Abandono de jogadores e correções de concorrência
+## Correções de consistência e concorrência
 
-**W.O.** — um `ScheduledExecutorService` (watchdog) verifica as partidas a cada segundo. Um jogador desconectado por mais de `--grace` segundos, ou que não joga na sua vez por mais de `--turn-timeout` segundos, perde por W.O.; a saída voluntária (`QUIT`) dá W.O. imediato. O reserva só ativa o watchdog ao receber o primeiro cliente (failover).
-
-**Condições de corrida corrigidas**
-- `broadcast`/`stateMessage` liam o conjunto de letras sem lock (risco de `ConcurrentModificationException`) e podiam entregar estados fora de ordem; agora são montados e enviados sob `stateLock`.
-- O pareamento segurava o 1º jogador bloqueado esperando o 2º sem verificar se ele continuava conectado; agora é revalidado a cada 500 ms. A entrada na fila é atômica (sem duplicatas).
-- A replicação usava uma thread por snapshot (entrega fora de ordem); agora há um único replicador que envia só o snapshot mais recente de cada partida, e snapshots atrasados de partidas antigas são ignorados.
-- Jogadores/partidas abandonados são removidos (antes vazavam memória).
-- Ordem de aquisição de locks padronizada: semáforo da partida → `stateLock`.
-
-**Limitação conhecida:** a réplica continua assíncrona; uma jogada em andamento no instante da queda do principal pode ser perdida.
+- O prazo do turno é validado dentro da mesma região crítica (`Semaphore` + `stateLock`) da jogada; o watchdog é apenas uma segunda proteção.
+- `turnStartedAt` faz parte do snapshot e não é alterado na promoção do reserva.
+- O reserva só aceita clientes após perder heartbeats do primário por um intervalo configurado; antes disso responde como standby e fecha a conexão.
+- `STATE` inclui os tokens dos dois jogadores, evitando ambiguidade quando os nomes são iguais.
+- `replayReady` e o token do último autor de jogada são replicados.
+- No modo online a GUI não inicia servidores locais automaticamente; falha de infraestrutura fica visível.
+- Nas VMs, a replicação é bidirecional e o primário possui atraso de preempção para receber o estado mais recente antes do failback.

@@ -1,208 +1,304 @@
-# Jogo da Forca Cliente/Servidor
+# Jogo da Forca Distribuído — Cliente/Servidor
 
-Projeto acadêmico completo em Java 17, usando TCP sockets. O servidor aceita vários clientes, mantém uma sala de espera, cria partidas independentes com exatamente dois jogadores e processa uma jogada por vez com `Semaphore(1)`.
+Projeto acadêmico em **Java 17** que implementa um jogo da forca cliente/servidor com sockets TCP, sala de espera, partidas de até dois jogadores, controle de turno no servidor, dois bonecos independentes, alta disponibilidade e persistência.
 
-O pacote possui interface gráfica tanto no modo solo quanto no modo online. Todas as jogadas passam pelo servidor, inclusive no modo solo: o bot funciona como o segundo cliente conectado por socket.
+A versão final suporta duas formas de demonstrar resiliência:
 
-## Início rápido — modo gráfico
+- **Docker + HAProxy** — recomendada para a apresentação;
+- **duas VMs + Keepalived/VRRP** — mantida para demonstrar a arquitetura pedida originalmente.
 
-No Windows, dê dois cliques em:
+## Requisitos da atividade
 
-```text
-INICIAR_JOGO.bat
-```
-
-Também é possível executar pelo terminal aberto na pasta `forca-online`:
-
-```cmd
-java client\GameLauncher.java
-```
-
-Na tela inicial, informe seu nome e escolha **Solo contra bot**. O programa inicia automaticamente servidor principal, servidor reserva e bot. O humano e o bot entram na mesma sala como dois clientes distintos. A tela mostra os dois bonecos, palavra, letras usadas, mensagens e jogador da vez. Antes de abrir, encerre qualquer servidor antigo que ainda esteja usando a porta 5050.
-
-O banco possui **156 palavras em 13 categorias**. A categoria escolhida é exibida acima da palavra. Quando um jogador acerta uma letra, seu perfil mostra temporariamente um emoji de provocação. O teclado usa desenho próprio para manter letras e botões visíveis mesmo com o tema escuro do Windows.
-
-Durante seu turno, você também pode escrever a resposta completa no campo **Adivinhar palavra**. Uma resposta incorreta acrescenta um erro e passa o turno; uma resposta correta encerra a partida. Ao final, o botão **Jogar de novo** prepara uma revanche: no solo o bot aceita automaticamente e, no online, os dois jogadores precisam clicar.
-
-Para dois jogadores reais, cada pessoa abre `Jogar_Online.bat`. O primeiro aguarda na sala e o segundo completa a partida. Em computadores diferentes, informe o IP virtual ou endereço do servidor.
-
-Cada jogador tem seu próprio personagem detalhado em pixel art e contador de erros. Cabeça, rosto, tronco, braços, mãos, pernas, calçados e roupas aparecem progressivamente a cada erro. A cena ajusta automaticamente sua escala à altura disponível, evitando que pernas ou calçados sejam cortados em telas menores. Toda alteração é transmitida aos dois clientes da partida. O projeto também inclui replicação de estado, reconexão automática e uma infraestrutura com duas VMs e IP virtual para demonstrar failover.
-
-## Requisitos atendidos
-
-| Requisito | Implementação |
+| Requisito | Como foi implementado |
 |---|---|
-| Comunicação por socket | `ServerSocket` e `Socket` TCP |
-| Servidor resiliente | duas VMs, Keepalived/VRRP, IP virtual e replicação do estado |
-| Múltiplos jogadores | thread por conexão e `BlockingQueue` na sala de espera |
-| Máximo de 2 por partida | cada `GameSession` recebe exatamente dois jogadores |
-| Um jogador por vez | `Semaphore(1, true)` e validação do token do turno |
-| Status para os dois clientes | mensagem `STATE` enviada simultaneamente aos dois |
-| Um boneco por jogador | erros separados em `Player.errors` |
-| Retomada após queda | token do jogador + snapshot replicado + reconexão automática |
-| Interface gráfica | Swing, Java2D e teclado clicável em `GameLauncher.java` |
-| Jogar sozinho | bot executado como segundo cliente TCP |
+| Comunicação por socket | `ServerSocket`/`Socket` TCP |
+| Servidor resiliente | `primary` + `backup`, replicação de snapshots e reconexão por token |
+| Substituição automática do servidor | Docker: HAProxy; VMs: Keepalived + IP virtual |
+| Múltiplas requisições | uma tarefa por cliente + `BlockingQueue<Player>` |
+| Sala de espera | jogadores aguardam na fila até formar um par |
+| Máximo 2 jogadores por partida | cada `GameSession` possui exatamente dois `Player` |
+| Um jogador por vez | `Semaphore(1, true)` + validação do jogador da vez |
+| Status enviado aos clientes | mensagem `STATE` transmitida aos dois jogadores |
+| Boneco separado por jogador | cada `Player` possui seu próprio contador `errors` |
+| Ambos veem ambos os bonecos | cada `STATE` carrega nome e erros dos dois jogadores |
+| Banco de dados | SQLite persistente por serviço HTTP no modo Docker |
+| Retomada de estado | replicação entre servidores + snapshots ativos no banco |
+| Proteção contra split brain | backup só promove após perder heartbeats do primário; no modo VM clientes usam apenas o IP virtual |
 
-## Estrutura
+## Arquitetura Docker
 
 ```text
-forca-online/
-├── client/Client.java
-├── client/GameLauncher.java
-├── INICIAR_JOGO.bat
-├── Jogar_Sozinho.bat
-├── Jogar_Online.bat
-├── server/Server.java
-├── server/words.txt
-├── docs/RELATORIO.md
-├── docs/GUIA-VM.md
-├── infra/Vagrantfile
-├── infra/keepalived-primary.conf
-├── infra/keepalived-backup.conf
+Cliente 1 ─┐
+Cliente 2 ─┼── TCP :5050 ──> HAProxy ──> Servidor PRIMARY
+Cliente N ─┘                    │              │
+                                │              ├── snapshots ──> Servidor BACKUP
+                                │              │
+                                └─ failover ───┘
+                                               │
+                                      HTTP snapshots
+                                               │
+                                        SQLite / volume
+```
+
+Os clientes usam **um único endereço: `127.0.0.1:5050`**. Se o servidor principal cair, a conexão TCP antiga termina; o cliente reconecta automaticamente no mesmo endereço e o HAProxy passa a nova conexão ao servidor reserva.
+
+## Início rápido — Docker
+
+Pré-requisitos: Docker e Java 17+.
+
+```bash
+docker compose up -d --build
+```
+
+Depois abra `Jogar_Online.bat` duas vezes e mantenha:
+
+```text
+Servidor: 127.0.0.1:5050
+```
+
+No Linux/macOS, também é possível abrir o cliente com:
+
+```bash
+java client/GameLauncher.java
+```
+
+Para forçar a queda do primário durante uma partida:
+
+```bash
+docker compose stop primary
+```
+
+A partida deve reconectar e continuar pelo reserva.
+
+Guia completo: `docs/GUIA-DOCKER.md`.
+
+## Interface gráfica
+
+`client/GameLauncher.java` é a interface Swing. Ela mostra:
+
+- categoria e palavra mascarada;
+- teclado clicável;
+- tentativa da palavra inteira;
+- letras já utilizadas;
+- jogador da vez;
+- cronômetro do turno visível para os dois jogadores (`SEU TEMPO` / `TEMPO DO ADVERSÁRIO`);
+- status de conexão/reconexão;
+- dois painéis de jogador;
+- um boneco independente para cada jogador;
+- revanche ao fim da partida.
+
+A interface não contém as regras da partida. Ela recebe `STATE` e apenas renderiza o estado decidido pelo servidor. A identidade visual usa os **tokens** de `p1` e `p2`, então dois jogadores podem ter o mesmo nome sem ambos aparecerem como “VOCÊ”.
+
+## Sala de espera e múltiplas partidas
+
+O servidor aceita conexões continuamente e usa uma `BlockingQueue<Player>`. O emparelhador retira dois jogadores conectados e cria uma `GameSession` exclusiva.
+
+Com quatro clientes:
+
+```text
+Jogador A + Jogador B -> Partida 1
+Jogador C + Jogador D -> Partida 2
+```
+
+Não existe limite global de duas conexões; o limite de dois é **por partida**.
+
+## Semáforo e turno
+
+Cada `GameSession` possui:
+
+```java
+new Semaphore(1, true)
+```
+
+Toda jogada entra na região crítica antes de alterar letras, erros, vencedor ou turno. Além disso, o servidor compara o jogador que enviou a requisição com `players[turnIndex]`. Portanto, mesmo que duas threads façam requisições, o estado é modificado de forma serializada e uma tentativa fora do turno é recusada.
+
+## Estado e dois bonecos
+
+Após uma jogada válida, o servidor envia `STATE` aos dois jogadores. A mensagem contém, entre outros campos:
+
+- partida;
+- palavra mascarada;
+- nome do jogador 1 e seus erros;
+- nome do jogador 2 e seus erros;
+- token do jogador da vez;
+- letras usadas;
+- status/vencedor;
+- versão do estado;
+- categoria.
+
+Se apenas o Jogador 1 errar, somente `p1.errors` aumenta. Mesmo assim, o novo estado completo é transmitido aos dois clientes, então ambos enxergam o boneco atualizado do Jogador 1 e o boneco inalterado do Jogador 2.
+
+## Persistência SQLite
+
+O serviço `database/db_service.py` usa o `sqlite3` da biblioteca padrão do Python e mantém:
+
+- tabela `matches`: último snapshot de cada partida;
+- tabela `snapshot_history`: histórico de versões recebidas.
+
+No Docker, os dados ficam no volume `forca_db`.
+
+Endpoints úteis para demonstração:
+
+```text
+GET http://localhost:8080/health
+GET http://localhost:8080/stats
+GET http://localhost:8080/matches
+```
+
+O Java recebe a URL pelo argumento:
+
+```text
+--db-url=http://database:8080
+```
+
+Sem `--db-url`, o jogo continua funcionando normalmente sem persistência externa.
+
+## Resiliência
+
+### Replicação
+
+O servidor ativo envia snapshots da partida para o outro nó. O snapshot contém palavra, categoria, tokens, nomes, erros, letras usadas, turno, resultado, versão, início do turno e pedidos de revanche pendentes. No modo VM a replicação é bidirecional; isso permite que o nó principal que retorna receba o estado mais novo antes de um eventual failback.
+
+### Reconexão
+
+Ao entrar pela primeira vez, o cliente recebe um token. Em uma queda de conexão, ele tenta novamente e envia:
+
+```text
+HELLO|nome|token
+```
+
+Se o token existir no servidor que assumiu, o jogador volta para sua `GameSession`.
+
+### Docker
+
+O HAProxy monitora `primary:5050` e `backup:5050`. O reserva recebe **heartbeats** do primário e rejeita clientes enquanto esses heartbeats estão recentes. Depois da queda, ele só se promove quando o prazo de promoção expira; assim uma conexão direta/acidental no reserva não cria uma segunda autoridade. Depois de um failover, o `primary` não reinicia automaticamente; o retorno é feito pelo script de failback controlado, evitando dois servidores ativos sobre a mesma partida.
+
+### VMs
+
+A opção original com duas VMs permanece em `infra/`. O Keepalived transfere `192.168.56.100` da VM principal para a reserva. A porta 5050 dos IPs reais das VMs é bloqueada no provisionamento, obrigando os clientes a usarem o VIP. A VM principal usa `preempt_delay` e recebe replicação reversa para ter tempo de sincronizar o estado antes de recuperar o VIP.
+
+## Banco de palavras
+
+`server/words.txt` contém 156 palavras em 13 categorias, no formato:
+
+```text
+CATEGORIA|PALAVRA
+```
+
+A seleção é feita no servidor.
+
+## Protocolo principal
+
+| Direção | Mensagem | Uso |
+|---|---|---|
+| cliente -> servidor | `HELLO|nomeBase64|token` | entrar/reconectar |
+| servidor -> cliente | `WELCOME|token|NEW/RECONNECTED` | identidade |
+| servidor -> cliente | `WAITING|...` | sala de espera |
+| cliente -> servidor | `GUESS|letraBase64` | jogar letra |
+| cliente -> servidor | `WORD|palavraBase64` | tentar palavra inteira |
+| cliente -> servidor | `REPLAY` | pedir revanche |
+| cliente -> servidor | `QUIT` | abandonar |
+| servidor -> ambos | `STATE|...` | estado completo |
+| primary -> backup | `SYNC|segredo|snapshot` | replicação |
+
+## W.O. e timeouts
+
+- `QUIT`: derrota imediata por W.O.;
+- desconexão: existe janela de reconexão configurada por `--grace`;
+- jogador parado na sua vez: `--turn-timeout` encerra por W.O.;
+- o padrão é **120 segundos por turno**; o servidor envia o tempo restante no `STATE` e os dois clientes exibem a mesma contagem regressiva;
+- a reconexão/failover não reinicia o cronômetro do turno;
+- o próprio `guess`/`guessWord` valida o deadline antes de aceitar a jogada, portanto uma requisição que chega após `00:00` perde por W.O. mesmo antes do próximo ciclo do watchdog;
+- `--turn-timeout=0` desativa o limite de turno e a interface mostra `SEM LIMITE`.
+
+## Testes automatizados
+
+Pré-requisitos: Python 3 e Java 17+.
+
+```bash
+python tests/integration_test.py
+python tests/walkover_test.py
+```
+
+O teste de integração valida com sockets reais:
+
+- quatro jogadores e duas partidas;
+- máximo de dois jogadores por partida;
+- recusa de jogada fora do turno;
+- estado idêntico nos dois clientes;
+- erros/bonecos independentes;
+- persistência SQLite;
+- replicação para o reserva;
+- queda do primário;
+- continuação no reserva;
+- restauração de partida após reiniciar todos os servidores usando o banco.
+
+`walkover_test.py` valida timeout, cronômetro e saída voluntária.
+
+`resilience_test.py` valida os casos de regressão mais críticos: backup em standby recusando cliente enquanto o primário vive, jogadores com nomes iguais identificados por token, cronômetro preservado no failover, jogada depois do deadline recusada com W.O. e pedido de revanche preservado através do failover.
+
+Também existe um autoteste do cliente gráfico/bot:
+
+```bash
+java client/GameLauncher.java --network-check
+```
+
+## Estrutura final
+
+```text
+forca-online-completo/
+├── client/
+│   ├── Client.java
+│   └── GameLauncher.java
+├── server/
+│   ├── Server.java
+│   └── words.txt
+├── database/
+│   ├── db_service.py
+│   └── schema.sql
+├── docker/
+│   ├── Dockerfile.server
+│   ├── Dockerfile.database
+│   └── haproxy.cfg
+├── docs/
+│   ├── GUIA-DOCKER.md
+│   ├── GUIA-VM.md
+│   └── RELATORIO.md
+├── infra/
+│   ├── Vagrantfile
+│   ├── keepalived-primary.conf
+│   └── keepalived-backup.conf
 ├── scripts/
-└── tests/integration_test.py
+├── tests/
+│   ├── integration_test.py
+│   └── walkover_test.py
+├── docker-compose.yml
+├── INICIAR_JOGO.bat
+├── Jogar_Online.bat
+└── Jogar_Sozinho.bat
 ```
 
-Não há Maven, Gradle ou bibliotecas externas. O Java 17 executa e compila os arquivos-fonte diretamente.
+## Execução sem Docker
 
-## Como o solo mantém os requisitos
-
-```text
-Cliente gráfico humano ─┐
-                       ├── Socket TCP → Servidor → GameSession(2 jogadores)
-Cliente bot ────────────┘                    │
-                                      Semaphore(1)
-                                             │
-                                  estado enviado aos dois
-```
-
-O bot não altera a palavra ou o turno diretamente. Ele apenas recebe `STATE` e envia `GUESS`, exatamente como outro cliente. O servidor continua responsável por sala de espera, pareamento, semáforo, erros individuais e replicação para o reserva.
-
-No início rápido, principal e reserva são processos locais para facilitar o teste. Para demonstrar especificamente o requisito de duas VMs e transferência de IP, utilize a configuração de `infra/` descrita em `docs/GUIA-VM.md`; o mesmo cliente gráfico pode se conectar ao IP virtual.
-
-## Execução simples em um computador
-
-Pré-requisitos: Java 17 ou superior e três terminais.
-
-Terminal 1 — servidor:
+Servidor principal:
 
 ```bash
 java server/Server.java --role=primary --port=5050
 ```
 
-Terminal 2 — primeiro jogador:
+Dois clientes de terminal:
 
 ```bash
-java client/Client.java --name=Luis --servers=127.0.0.1:5050
+java client/Client.java --name=Ana --servers=127.0.0.1:5050
+java client/Client.java --name=Bruno --servers=127.0.0.1:5050
 ```
 
-Terminal 3 — segundo jogador:
-
-```bash
-java client/Client.java --name=Joao --servers=127.0.0.1:5050
-```
-
-No Windows, os scripts equivalentes estão em `scripts\run-primary.bat` e `scripts\run-client.bat`.
-
-## Demonstração local do failover
-
-O script abaixo inicia o principal na porta 5050 e o reserva na 5052. A replicação usa a porta 5051:
+Para simular dois processos localmente com failover por lista de endereços:
 
 ```bash
 bash scripts/run-local-demo.sh
 ```
 
-Abra dois terminais de cliente:
+## Observações técnicas
 
-```bash
-java client/Client.java --name=Luis --servers=127.0.0.1:5050,127.0.0.1:5052
-java client/Client.java --name=Joao --servers=127.0.0.1:5050,127.0.0.1:5052
-```
-
-Ao encerrar o servidor principal, os clientes tentam o segundo endereço, enviam seus tokens e recebem o último estado replicado.
-
-## Demonstração com duas VMs
-
-Com Vagrant e VirtualBox instalados:
-
-```bash
-cd infra
-vagrant up
-```
-
-Endereços usados:
-
-- VM principal: `192.168.56.11`
-- VM reserva: `192.168.56.12`
-- IP virtual acessado pelos clientes: `192.168.56.100`
-
-Cliente:
-
-```bash
-java client/Client.java --name=Luis --servers=192.168.56.100:5050
-```
-
-Para simular a falha durante uma partida:
-
-```bash
-cd infra
-vagrant halt -f primary
-```
-
-O Keepalived transfere o IP virtual para a VM reserva. A conexão TCP antiga cai — isso é inevitável —, mas o cliente reconecta no mesmo IP e recupera a partida usando seu token. Consulte `docs/GUIA-VM.md` para a apresentação passo a passo.
-
-## Teste automatizado
-
-Com Python 3 e Java 17:
-
-```bash
-python3 tests/integration_test.py
-```
-
-O teste abre servidores e sockets reais e valida:
-
-- formação de duas partidas com quatro jogadores;
-- turnos e estados iguais nos dois clientes;
-- erros e bonecos individuais;
-- replicação de estado;
-- queda do principal;
-- reconexão ao reserva e continuação da partida.
-
-Resultado esperado:
-
-```text
-OK: lobby, semaforo, dois bonecos, replicacao e failover validados.
-```
-
-## Abandono, W.O. e timeouts
-
-O servidor nunca deixa um jogador esperando para sempre:
-
-| Situação | Comportamento |
-|---|---|
-| Jogador fecha o jogo (`QUIT` / `/sair`) | W.O. imediato para o adversário |
-| Conexão cai | o adversário é avisado; o jogador tem `--grace` segundos (padrão 30) para reconectar com o token; depois perde por W.O. |
-| Jogador conectado mas parado na sua vez | perde por W.O. após `--turn-timeout` segundos (padrão 120; `0` desativa). Cobre também quedas "silenciosas" de rede |
-| Os dois somem | perde quem caiu primeiro; a partida e os tokens são removidos |
-| Adversário sai e o outro clica em "Jogar de novo" | volta automaticamente para a sala de espera e é pareado com um novo jogador |
-| Servidor reserva assume após failover | o controle de W.O. só começa quando o reserva recebe o primeiro cliente, para não punir jogadores durante o failover |
-
-Exemplo: `java server/Server.java --grace=20 --turn-timeout=60`
-
-## Testes
-
-```bash
-python3 tests/integration_test.py   # lobby, semáforo, bonecos, replicação, failover
-python3 tests/walkover_test.py      # W.O., timeouts, revanche sem adversário, failover+W.O., carga concorrente
-```
-
-## Comandos do cliente
-
-- digite uma letra e pressione Enter para jogar;
-- `/sair` encerra o cliente;
-- uma letra fora do turno é recusada pelo servidor;
-- letras repetidas não consomem o turno.
-
-## Observação de segurança
-
-A porta de replicação usa uma chave compartilhada simples, adequada para a demonstração acadêmica. Em produção, a replicação deveria usar TLS, autenticação forte e armazenamento persistente.
+A replicação entre principal e reserva é assíncrona. Portanto, uma falha exatamente antes da entrega do último snapshot pode perder a jogada mais recente. Para um trabalho acadêmico isso é uma limitação aceitável e documentada; em produção seria indicado usar consenso/log durável, autenticação forte/TLS e um banco altamente disponível.

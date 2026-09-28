@@ -1,0 +1,74 @@
+services:
+  database:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.database
+    environment:
+      FORCA_DB_PATH: /data/forca.db
+    volumes:
+      - forca_db:/data
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=1).read()"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+    restart: unless-stopped
+
+  backup:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.server
+    command:
+      - --role=backup
+      - --port=5050
+      - --replication-port=5051
+      - --words=server/words.txt
+      - --db-url=http://database:8080
+      - --grace=30
+      - --turn-timeout=120
+    depends_on:
+      database:
+        condition: service_healthy
+    expose:
+      - "5050"
+      - "5051"
+    restart: unless-stopped
+
+  primary:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.server
+    command:
+      - --role=primary
+      - --port=5050
+      - --peer=backup:5051
+      - --words=server/words.txt
+      - --db-url=http://database:8080
+      - --grace=30
+      - --turn-timeout=120
+    depends_on:
+      database:
+        condition: service_healthy
+      backup:
+        condition: service_started
+    expose:
+      - "5050"
+    # O primary não reinicia sozinho: após failover, use o script de failback controlado.
+    restart: "no"
+
+  proxy:
+    image: haproxy:3.0-alpine
+    volumes:
+      - ./docker/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    depends_on:
+      - primary
+      - backup
+    ports:
+      - "5050:5050"
+      - "8404:8404"
+    restart: unless-stopped
+
+volumes:
+  forca_db:

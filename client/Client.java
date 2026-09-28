@@ -120,6 +120,8 @@ public class Client {
         String winnerToken = f[10];
         String message = dec(f[11]);
         String word = dec(f[13]);
+        int timeoutSeconds = f.length >= 16 ? Integer.parseInt(f[15]) : 120;
+        long remainingMillis = f.length >= 17 ? Long.parseLong(f[16]) : -1L;
 
         clearScreen();
         System.out.println("JOGO DA FORCA ONLINE    Partida " + matchId);
@@ -131,6 +133,14 @@ public class Client {
         System.out.println(p2 + " - erros: " + e2 + "/6");
         System.out.println(drawHangman(e2));
         System.out.println(message);
+        if (status.equals("PLAYING")) {
+            if (timeoutSeconds <= 0 || remainingMillis < 0) {
+                System.out.println("Tempo por turno: sem limite");
+            } else {
+                long total = (remainingMillis + 999L) / 1000L;
+                System.out.printf("Tempo restante: %02d:%02d%n", total / 60L, total % 60L);
+            }
+        }
 
         if (status.equals("FINISHED")) {
             System.out.println("Palavra: " + word);
