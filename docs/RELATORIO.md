@@ -148,14 +148,3 @@ Um `ScheduledExecutorService` executa o watchdog:
 - para produção seriam recomendados TLS, autenticação forte, observabilidade e um mecanismo de consenso/log durável.
 
 Essas limitações são transparentes e não impedem a demonstração dos requisitos acadêmicos propostos.
-
-
-## Correções de consistência e concorrência
-
-- O prazo do turno é validado dentro da mesma região crítica (`Semaphore` + `stateLock`) da jogada; o watchdog é apenas uma segunda proteção.
-- `turnStartedAt` faz parte do snapshot e não é alterado na promoção do reserva.
-- O reserva só aceita clientes após perder heartbeats do primário por um intervalo configurado; antes disso responde como standby e fecha a conexão.
-- `STATE` inclui os tokens dos dois jogadores, evitando ambiguidade quando os nomes são iguais.
-- `replayReady` e o token do último autor de jogada são replicados.
-- No modo online a GUI não inicia servidores locais automaticamente; falha de infraestrutura fica visível.
-- Nas VMs, a replicação é bidirecional e o primário possui atraso de preempção para receber o estado mais recente antes do failback.

@@ -143,8 +143,3 @@ docker compose down -v
 6. Mostre "RECONECTANDO" e depois a continuação da mesma partida no reserva.
 7. Abra `http://localhost:8080/stats` para mostrar a persistência.
 8. Se quiser comprovação automática, rode `python tests/integration_test.py`.
-
-
-## Promoção segura do reserva
-
-O servidor principal envia heartbeat pela porta de replicação. O backup continua ouvindo, mas rejeita conexões de jogo enquanto o heartbeat está recente. Depois que o primário cai, o HAProxy passa as novas conexões ao backup; se a janela de promoção ainda não tiver terminado, a conexão é fechada e o cliente tenta novamente automaticamente. Quando o heartbeat está vencido, o backup se promove e recupera os jogadores pelos tokens. Isso evita que alguém transforme o reserva em servidor ativo apenas conectando diretamente nele.

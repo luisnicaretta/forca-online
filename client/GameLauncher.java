@@ -1,9 +1,11 @@
+import javax.imageio.ImageIO;
 import javax.swing.*;
 import javax.swing.border.EmptyBorder;
 import java.awt.*;
 import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
 import java.awt.geom.RoundRectangle2D;
+import java.awt.image.BufferedImage;
 import java.io.*;
 import java.net.*;
 import java.nio.charset.StandardCharsets;
@@ -823,6 +825,18 @@ public class GameLauncher {
     }
 
     static final class HangmanView extends JPanel {
+        private static final BufferedImage SPRITE = loadHangmanSprite();
+        private static final double[][] SPRITE_PARTS = {
+                {0.19, 0.00, 0.81, 0.22}, // cabeça
+                {0.07, 0.16, 0.93, 0.50}, // ombros e tronco superior
+                {0.00, 0.18, 0.35, 0.74}, // braço esquerdo
+                {0.65, 0.18, 1.00, 0.74}, // braço direito
+                {0.12, 0.46, 0.88, 0.79}, // tronco inferior e quadril
+                {0.09, 0.72, 0.91, 1.00}  // pernas e tenis
+        };
+        private static final double SPRITE_NECK_X = 0.50;
+        private static final double SPRITE_NECK_Y = 0.235;
+
         String playerName = "AGUARDANDO...";
         int errors;
         boolean me;
@@ -831,7 +845,7 @@ public class GameLauncher {
 
         HangmanView() {
             setOpaque(false);
-            setPreferredSize(new Dimension(420, 365));
+            setPreferredSize(new Dimension(500, 520));
         }
 
         void update(String name, int errors, boolean me) {
@@ -857,6 +871,7 @@ public class GameLauncher {
             super.paintComponent(graphics);
             Graphics2D g = (Graphics2D) graphics.create();
             g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+            g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_NEAREST_NEIGHBOR);
             int w = getWidth();
             g.setColor(me ? GOLD : GREEN);
             g.fillOval(14, 6, 52, 52);
@@ -878,14 +893,33 @@ public class GameLauncher {
 
             int cx = w / 2;
             int top = 68;
+            paintGallows(g, cx, top);
+            if (SPRITE != null) paintSpriteHangman(g, cx, top);
+            else paintClassicHangman(g, cx, top);
+            g.dispose();
+        }
+
+        private void paintGallows(Graphics2D g, int cx, int top) {
+            int panelW = getWidth();
+            int panelH = getHeight();
+            int groundY = panelH - 24;
+            int topY = top + 4;
+            int postX = Math.max(72, cx - Math.max(120, panelW / 4));
+            int beamRightX = Math.min(panelW - 104, cx + Math.max(20, panelW / 20));
+            int ropeBottomY = topY + Math.max(46, panelH / 11);
+            int baseLeft = Math.max(24, postX - 42);
+            int baseRight = Math.min(panelW - 28, beamRightX + 76);
+
             g.setStroke(new BasicStroke(7, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
             g.setColor(new Color(94, 109, 135));
-            g.drawLine(cx - 145, top + 275, cx + 135, top + 275);
-            g.drawLine(cx - 105, top + 275, cx - 105, top);
-            g.drawLine(cx - 105, top, cx + 65, top);
-            g.drawLine(cx + 65, top, cx + 65, top + 35);
-            g.drawLine(cx - 105, top + 50, cx - 55, top);
+            g.drawLine(baseLeft, groundY, baseRight, groundY);
+            g.drawLine(postX, groundY, postX, topY);
+            g.drawLine(postX, topY, beamRightX, topY);
+            g.drawLine(beamRightX, topY, beamRightX, ropeBottomY);
+            g.drawLine(postX, topY + Math.max(44, panelH / 9), postX + Math.max(46, panelW / 10), topY);
+        }
 
+        private void paintClassicHangman(Graphics2D g, int cx, int top) {
             g.setColor(GOLD);
             g.setStroke(new BasicStroke(7, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
             if (errors >= 1) g.drawOval(cx + 32, top + 35, 66, 66);
@@ -894,7 +928,76 @@ public class GameLauncher {
             if (errors >= 4) g.drawLine(cx + 65, top + 125, cx + 115, top + 168);
             if (errors >= 5) g.drawLine(cx + 65, top + 195, cx + 20, top + 252);
             if (errors >= 6) g.drawLine(cx + 65, top + 195, cx + 110, top + 252);
-            g.dispose();
+        }
+
+        private void paintSpriteHangman(Graphics2D g, int cx, int top) {
+            if (errors <= 0) return;
+            int panelW = getWidth();
+            int panelH = getHeight();
+            int topY = top + 4;
+            int ropeX = Math.min(panelW - 104, cx + Math.max(20, panelW / 20));
+            int hookY = topY + Math.max(46, panelH / 11);
+            int groundY = panelH - 24;
+            int ropeLength = Math.max(10, panelH / 36);
+
+            int maxHeightByBottom = groundY - 10 - (hookY + ropeLength);
+            int targetHeight = Math.max(230, Math.min((int) Math.round((groundY - topY) * 0.92), maxHeightByBottom <= 0 ? 230 : (int) Math.round(maxHeightByBottom / (1.0 - SPRITE_NECK_Y))));
+            int targetWidth = Math.max(140, (int) Math.round(targetHeight * (SPRITE.getWidth() / (double) SPRITE.getHeight())));
+            int widthCap = Math.max(140, Math.min(240, (int) Math.round(panelW * 0.58)));
+            if (targetWidth > widthCap) {
+                double scale = widthCap / (double) SPRITE.getWidth();
+                targetWidth = widthCap;
+                targetHeight = (int) Math.round(SPRITE.getHeight() * scale);
+            }
+
+            int drawW = targetWidth;
+            int drawH = targetHeight;
+            int drawX = ropeX - (int) Math.round(drawW * SPRITE_NECK_X);
+            int drawY = hookY + ropeLength - (int) Math.round(drawH * SPRITE_NECK_Y);
+
+            drawX = Math.max(24, Math.min(drawX, panelW - drawW - 24));
+            drawY = Math.max(topY + 6, Math.min(drawY, groundY - drawH - 6));
+
+            int neckX = drawX + (int) Math.round(drawW * SPRITE_NECK_X);
+            int neckY = drawY + (int) Math.round(drawH * SPRITE_NECK_Y);
+
+            g.setColor(new Color(0, 0, 0, 70));
+            g.fillOval(drawX + drawW / 5, drawY + drawH - 3, drawW * 3 / 5, 11);
+
+            for (int i = 0; i < Math.min(errors, SPRITE_PARTS.length); i++) {
+                drawSpritePart(g, drawX, drawY, drawW, drawH, SPRITE_PARTS[i]);
+            }
+
+        }
+
+
+        private void drawSpritePart(Graphics2D g, int drawX, int drawY, int drawW, int drawH, double[] part) {
+            int x1 = drawX + (int) Math.round(drawW * part[0]) - 2;
+            int y1 = drawY + (int) Math.round(drawH * part[1]) - 2;
+            int x2 = drawX + (int) Math.round(drawW * part[2]) + 2;
+            int y2 = drawY + (int) Math.round(drawH * part[3]) + 2;
+            Shape oldClip = g.getClip();
+            g.setClip(new Rectangle(x1, y1, Math.max(1, x2 - x1), Math.max(1, y2 - y1)));
+            g.drawImage(SPRITE, drawX, drawY, drawW, drawH, null);
+            g.setClip(oldClip);
+        }
+
+        private static BufferedImage loadHangmanSprite() {
+            List<Path> candidates = List.of(
+                    Path.of("client", "assets", "hangman_sprite.png"),
+                    Path.of("assets", "hangman_sprite.png"),
+                    Path.of("hangman_sprite.png")
+            );
+            for (Path candidate : candidates) {
+                try {
+                    File file = candidate.toFile();
+                    if (!file.exists()) continue;
+                    BufferedImage raw = ImageIO.read(file);
+                    if (raw == null) continue;
+                    return raw;
+                } catch (IOException ignored) { }
+            }
+            return null;
         }
 
         private void paintColorReaction(Graphics2D g, int x, int y, int type) {
